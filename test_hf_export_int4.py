@@ -940,6 +940,10 @@ class PhiExportTests(unittest.TestCase):
             self.assertIsNone(model.config.sliding_window)
             graph = ov.Core().read_model(Path(directory) / "openvino_model.xml")
             self.assertTrue(graph.get_variables())
+            self.assertEqual({port.get_any_name() for port in graph.inputs},
+                             {"input_ids", "position_ids", "attention_mask", "beam_idx"})
+            self.assertEqual(graph.input("attention_mask").get_partial_shape().rank.get_length(), 2)
+            self.assertEqual(graph.input("attention_mask").get_element_type(), ov.Type.i64)
             compiled = ov.Core().compile_model(graph, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
             request = compiled.create_infer_request()
             for prompt_length in (7, 35, 5):

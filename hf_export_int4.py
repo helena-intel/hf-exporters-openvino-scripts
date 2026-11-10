@@ -9,7 +9,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import openvino as ov
 from pathlib import Path
 import torch
-from transformers.exporters.utils import decompose_for_generation, get_leaf_tensors
+from transformers.exporters.decompose import decompose_for_generation
+from transformers.exporters.utils import get_leaf_tensors
 from openvino_tokenizers import convert_tokenizer
 from int4_config import apply_runtime_config, make_quantizer, resolve_int4_config
 
@@ -46,7 +47,9 @@ inputs = tokenizer(["Hello, world!"] * 2, return_tensors="pt")
 exporter = OpenVINOExporter()
 
 components = decompose_for_generation(model, inputs, multi_token_decode=True)
-decode_model, decode_inputs = components["decode"]
+decode = components["model"]
+decode_model, decode_inputs = decode.module, decode.inputs
+decode_inputs.pop("logits_to_keep", None)
 batch_size, sequence_length = decode_inputs["input_ids"].shape
 past_length = decode_inputs["past_key_values"].get_seq_length()
 decode_inputs["attention_mask"] = torch.ones(
@@ -64,7 +67,7 @@ dynamic_shapes["past_key_values"] = [
 openvino_int4 = OpenVINOConfig(
     dynamic_shapes=dynamic_shapes, stateful=True, quantizer=quantizer
 )
-ov_model = exporter.export(decode_model, decode_inputs, openvino_int4)
+ov_model = exporter.export(decode_model, decode_inputs, openvino_int4).program
 
 preprocessor = ov.preprocess.PrePostProcessor(ov_model)
 preprocessor.output("logits").tensor().set_element_type(ov.Type.f32)
