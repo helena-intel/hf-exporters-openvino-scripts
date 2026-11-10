@@ -31,13 +31,21 @@ def main(argv=None):
     parser.add_argument("--prompt", default="What is OpenVINO?")
     parser.add_argument("--device", default="CPU")
     parser.add_argument("--max-new-tokens", type=int, default=100)
+    parser.add_argument("--no-chat-template", action="store_true",
+                        help="Use the raw prompt instead of the tokenizer's saved chat template")
     args = parser.parse_args(argv)
     if not args.prompt.strip():
         parser.error("--prompt must not be empty")
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
     model, tokenizer = load_model(args.model_dir, args.device)
-    inputs = tokenizer(args.prompt, return_tensors="pt")
+    if tokenizer.chat_template and not args.no_chat_template:
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.prompt}], tokenize=False, add_generation_prompt=True,
+        )
+        inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+    else:
+        inputs = tokenizer(args.prompt, return_tensors="pt")
     with torch.inference_mode():
         outputs = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False,
                                  num_beams=1, num_return_sequences=1, return_dict_in_generate=False)
