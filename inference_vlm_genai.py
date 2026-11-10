@@ -21,7 +21,7 @@ print(f"Model loading duration: {end_time-start_time:.2f}")
 
 image = Image.open("dog.jpg")
 # optional: resizing to a smaller size (depending on image and prompt) is often useful to speed up inference. 
-image = image.resize((512, 512))
+# image = image.resize((512, 512))
 
 image_data = np.array(image.getdata()).reshape(1, image.size[1], image.size[0], 3).astype(np.uint8)
 image_data = ov.Tensor(image_data)  
