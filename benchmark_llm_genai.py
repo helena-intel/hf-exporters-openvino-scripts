@@ -9,6 +9,8 @@ import sys
 import openvino_genai as ov_genai
 from openvino import get_version
 
+from llm_prompt import add_prompt_arguments, disable_genai_thinking
+
 
 def main():
     parser = argparse.ArgumentParser(description="Help command")
@@ -19,6 +21,7 @@ def main():
     parser.add_argument("-n", "--num_iter", type=int, default=3, help="Number of iterations")
     parser.add_argument("-M", "--max_new_tokens", type=int, default=20, help="Maximal number of new tokens")
     parser.add_argument("-d", "--device", type=str, default="CPU", help="Device")
+    add_prompt_arguments(parser)
 
     args = parser.parse_args()
 
@@ -44,7 +47,7 @@ def main():
 
     config = ov_genai.GenerationConfig()
     config.max_new_tokens = args.max_new_tokens
-    config.apply_chat_template = False
+    config.apply_chat_template = not args.no_chat_template
 
     if device == "NPU":
         pipe = ov_genai.LLMPipeline(models_path, device)
@@ -54,7 +57,25 @@ def main():
         scheduler_config.max_num_batched_tokens = sys.maxsize
         pipe = ov_genai.LLMPipeline(models_path, device, scheduler_config=scheduler_config)
 
-    input_data = pipe.get_tokenizer().encode(prompt)
+    tokenizer = pipe.get_tokenizer()
+    if config.apply_chat_template:
+        if args.disable_thinking:
+            try:
+                disable_genai_thinking(tokenizer)
+            except ValueError as error:
+                parser.error(str(error))
+        formatted_prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt[0]}], add_generation_prompt=True,
+        )
+        input_data = tokenizer.encode([formatted_prompt], add_special_tokens=False)
+    else:
+        input_data = tokenizer.encode(prompt)
+    if args.no_chat_template:
+        print("Chat template: not applied.")
+    elif args.disable_thinking:
+        print("Chat template: enable_thinking=False requested (model-dependent).")
+    else:
+        print("Chat template: model-default thinking behavior.")
     prompt_token_size = input_data.input_ids.get_shape()[1]
     print(f"Prompt token size: {prompt_token_size}")
 

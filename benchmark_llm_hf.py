@@ -1,4 +1,4 @@
-"""Benchmark native HF OpenVINO text generation without a chat template.
+"""Benchmark native HF OpenVINO text generation requesting non-thinking chat by default.
 
 Generation and TTFT exclude tokenization and detokenization, reported separately.
 Each call starts a new generation without passing a previous cache. TPOT measures
@@ -17,6 +17,7 @@ import torch
 import transformers
 
 from inference_llm_hf import load_model
+from llm_prompt import add_prompt_arguments, prepare_prompt
 
 
 class TokenTimer:
@@ -36,11 +37,14 @@ class TokenTimer:
         pass
 
 
-def generate(model, tokenizer, prompt, *, max_new_tokens=20):
+def generate(model, tokenizer, prompt, *, max_new_tokens=20, disable_thinking=True, use_chat_template=True):
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
+    text, templated = prepare_prompt(
+        tokenizer, prompt, use_chat_template=use_chat_template, disable_thinking=disable_thinking,
+    )
     started = perf_counter()
-    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs = tokenizer(text, return_tensors="pt", **({"add_special_tokens": False} if templated else {}))
     tokenization_s = perf_counter() - started
     generation = copy.deepcopy(model.generation_config)
     generation.update(max_new_tokens=max_new_tokens, min_new_tokens=None, min_length=0,
@@ -82,6 +86,7 @@ def main(argv=None):
     parser.add_argument("-M", "--max_new_tokens", "--max-new-tokens", type=int, default=20)
     parser.add_argument("-d", "--device", default="CPU")
     parser.add_argument("--torch-threads", type=int, default=1)
+    add_prompt_arguments(parser)
     args = parser.parse_args(argv)
     if args.num_warmup < 0 or args.num_iter < 1 or args.max_new_tokens < 1 or args.torch_threads < 1:
         parser.error("Warmups must be nonnegative; iterations, max_new_tokens, and threads must be positive")
@@ -101,8 +106,10 @@ def main(argv=None):
     model, tokenizer = load_model(args.model, args.device)
     load_s = perf_counter() - started
     for _ in range(args.num_warmup):
-        generate(model, tokenizer, prompt, max_new_tokens=args.max_new_tokens)
-    results = [generate(model, tokenizer, prompt, max_new_tokens=args.max_new_tokens)
+        generate(model, tokenizer, prompt, max_new_tokens=args.max_new_tokens,
+               disable_thinking=args.disable_thinking, use_chat_template=not args.no_chat_template)
+    results = [generate(model, tokenizer, prompt, max_new_tokens=args.max_new_tokens,
+                   disable_thinking=args.disable_thinking, use_chat_template=not args.no_chat_template)
                for _ in range(args.num_iter)]
     counts = [result["output_tokens"] for result in results]
     print(f"Prompt token size: {results[-1]['input_tokens']}")
@@ -125,7 +132,13 @@ def main(argv=None):
             print(f"{label}: {np.mean(values):.2f} +/- {np.std(values):.2f} {unit}")
         else:
             print(f"{label}: N/A (fewer than two output tokens)")
-    print("Generation timing excludes tokenization and detokenization; no chat template is applied.")
+    print("Generation timing excludes tokenization, detokenization, and chat-template rendering.")
+    if args.no_chat_template or not tokenizer.chat_template:
+        print("Chat template: not applied.")
+    elif args.disable_thinking:
+        print("Chat template: enable_thinking=False requested (model-dependent).")
+    else:
+        print("Chat template: model-default thinking behavior.")
     print("TPOT and throughput exclude runs with fewer than two output tokens.")
 
 
