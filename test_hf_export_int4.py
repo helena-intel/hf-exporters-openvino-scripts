@@ -195,6 +195,44 @@ class CompressionConfigTests(unittest.TestCase):
         self.assertEqual(events, ["closed"])
         self.assertEqual(make_compression_config({"bits": 4, "dataset": "wikitext2"}).subset_size, 128)
 
+    def test_text_calibration_bf16_values_for_fp32_graph(self):
+        from unittest.mock import Mock
+        from int4_config import prepare_text_calibration
+
+        recipe = {"bits": 4, "dataset": "wikitext2", "num_samples": 1}
+        exporter = Mock()
+        exporter._resolve_generation_options.return_value = (None, True, True)
+        activation = torch.tensor([[1.5, -2.25]], dtype=torch.bfloat16)
+        token_ids = torch.tensor([[1, 2]], dtype=torch.long)
+
+        def samples(*args):
+            yield {"input_ids": token_ids}
+
+        for precision in (ov.Type.f32, ov.Type.bf16):
+            for input_name in ("inputs", "input.inputs"):
+                with self.subTest(precision=precision, input_name=input_name):
+                    parameter = ov.opset13.parameter([1, 2], dtype=precision, name=input_name)
+                    parameter.output(0).get_tensor().set_names({input_name})
+                    ids_parameter = ov.opset13.parameter([1, 2], dtype=ov.Type.i64, name="input_ids")
+                    ids_parameter.output(0).get_tensor().set_names({"input_ids"})
+                    graph = ov.Model([ov.opset13.convert(parameter, ov.Type.f32), ids_parameter],
+                                     [parameter, ids_parameter])
+                    with patch("int4_config.text_calibration_samples", side_effect=samples), \
+                            patch("transformers.exporters.quantizers.utils.capture_calibration_inputs",
+                                  return_value={"model": [{"inputs": activation, "input_ids": token_ids}]}), \
+                            patch("transformers.exporters.precompute.precompute_export_inputs",
+                                  side_effect=lambda config, inputs: inputs):
+                        with prepare_text_calibration(
+                            Mock(), Mock(), recipe, exporter=exporter, export_configs={},
+                        ) as providers:
+                            feeds = list(providers["model"](graph, {}))
+                    compiled = ov.Core().compile_model(graph, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
+                    actual = compiled.create_infer_request().infer(feeds[0], share_inputs=True)
+                    np.testing.assert_array_equal(actual[0], activation.float().numpy())
+                    np.testing.assert_array_equal(actual[1], token_ids.numpy())
+                    self.assertEqual(feeds[0]["input_ids"].dtype, np.int64)
+        self.assertEqual(activation.dtype, torch.bfloat16)
+
     def test_text_calibration_preserves_explicit_mask_only_when_requested(self):
         from unittest.mock import Mock
         from int4_config import prepare_text_calibration

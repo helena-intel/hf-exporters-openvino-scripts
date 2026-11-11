@@ -333,10 +333,19 @@ def _prepare_calibration(model, recipes, samples, *, exporter, export_configs, d
 
         def provider(files):
             def feeds(graph, sample_inputs):
+                fp32_inputs = {
+                    name.removeprefix("input.") for port in graph.inputs
+                    if port.get_element_type().get_type_name() == "f32" for name in port.get_names()
+                }
                 class Samples:
                     def __iter__(self):
                         for path in files:
                             values = torch.load(path, map_location="cpu", weights_only=True)
+                            values = {
+                                name: value.float() if name in fp32_inputs and isinstance(value, torch.Tensor)
+                                and value.dtype == torch.bfloat16
+                                else value for name, value in values.items()
+                            }
                             feed = openvino_feed(graph, values)
                             missing = [port.get_any_name() for port in graph.inputs
                                        if not port.get_names().intersection(feed)]
