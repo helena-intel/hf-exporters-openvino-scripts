@@ -2,7 +2,7 @@
 
 Explicit CLI settings override the matching model/component entry in int4_configs.json.
 Unknown models retain the generic fallback recipe. Calibration can use preprocessed
-.npz files or Hugging Face TextVQA samples selected by the unified exporter's recipe
+.npz files or Hugging Face text/TextVQA samples selected by the exporter's recipe
 or an explicit dataset override.
 """
 
@@ -16,6 +16,11 @@ import tempfile
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("int4_configs.json")
 DEFAULT_VLM_CALIBRATION_SAMPLES = 32
+DEFAULT_TEXT_CALIBRATION_SAMPLES = 128
+TEXT_CALIBRATION_DATASETS = {
+    "wikitext2": ("Salesforce/wikitext", "wikitext-2-raw-v1"),
+    "gsm8k": ("openai/gsm8k", "main"),
+}
 FALLBACK_CONFIG = {
     "bits": 4, "sym": False, "group_size": 128, "ratio": 1.0,
     "all_layers": False, "sensitivity_metric": "weight_quantization_error",
@@ -117,6 +122,8 @@ def make_compression_config(recipe):
         kwargs["subset_size"] = recipe["num_samples"]
     elif recipe.get("dataset") == "textvqa":
         kwargs["subset_size"] = DEFAULT_VLM_CALIBRATION_SAMPLES
+    elif recipe.get("dataset") in TEXT_CALIBRATION_DATASETS:
+        kwargs["subset_size"] = DEFAULT_TEXT_CALIBRATION_SAMPLES
     if recipe.get("backup_precision") is not None:
         kwargs["backup_mode"] = nncf.BackupMode(recipe["backup_precision"])
     if recipe.get("ignored_scope") is not None:
@@ -141,8 +148,8 @@ def make_quantizer(recipe, calibration_data=None, *, calibration_samples=None):
     if needs_data and calibration_data is None and calibration_samples is None:
         raise ValueError(
             f"This recipe requires representative calibration data (dataset={recipe.get('dataset')!r}). "
-            "Supply --calibration-dataset textvqa in hf_export_models_int4.py, "
-            "or --calibration-data with preprocessed OpenVINO input .npz files, or edit the "
+            "Supported recipe datasets are prepared automatically by the LLM/VLM export scripts. "
+            "For other datasets, supply --calibration-data with preprocessed OpenVINO input .npz files, or edit the "
             "local recipe to remove dataset and disable data-dependent algorithms. "
             "Export example inputs will not be substituted for calibration data."
         )
@@ -175,6 +182,43 @@ def make_quantizer(recipe, calibration_data=None, *, calibration_samples=None):
             return nncf.compress_weights(model, dataset=dataset, **self.config.to_kwargs())
 
     return OpenVINOWeightQuantizer(compression)
+
+
+def text_calibration_samples(tokenizer, recipe, seed=42, sequence_length=128):
+    from datasets import load_dataset
+
+    name = recipe.get("dataset")
+    if name not in TEXT_CALIBRATION_DATASETS:
+        raise ValueError(f"Unsupported text calibration dataset: {name!r}")
+    limit = recipe.get("num_samples", DEFAULT_TEXT_CALIBRATION_SAMPLES)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError("Calibration num_samples must be a positive integer")
+    dataset = load_dataset(*TEXT_CALIBRATION_DATASETS[name], split="train", streaming=True)
+    shuffle_kwargs = {"seed": seed}
+    if "max_buffer_input_shards" in inspect.signature(dataset.shuffle).parameters:
+        shuffle_kwargs["max_buffer_input_shards"] = 1
+    iterator = iter(dataset.shuffle(**shuffle_kwargs))
+    count = 0
+    try:
+        for row in iterator:
+            text = row.get("text") if name == "wikitext2" else "\n".join(
+                str(row.get(field, "")) for field in ("question", "answer")
+            )
+            if not isinstance(text, str) or not text.strip():
+                continue
+            sample = dict(tokenizer(text, return_tensors="pt", truncation=True, max_length=sequence_length))
+            if sample["input_ids"].shape[1] < 2:
+                continue
+            yield sample
+            count += 1
+            if count >= limit:
+                break
+        if count == 0:
+            raise ValueError(f"{name} calibration dataset has no usable text samples")
+    finally:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            close()
 
 
 def textvqa_samples(processor, num_samples, seed):
@@ -212,6 +256,25 @@ def textvqa_samples(processor, num_samples, seed):
 
 @contextmanager
 def prepare_textvqa_calibration(model, processor, recipes, *, exporter, export_configs, seed=42):
+    limit = max((recipe.get("num_samples", DEFAULT_VLM_CALIBRATION_SAMPLES)
+                 for recipe in recipes.values() if recipe is not None and recipe.get("bits", 4) == 4), default=0)
+    samples = textvqa_samples(processor, limit, seed)
+    with _prepare_calibration(model, recipes, samples, exporter=exporter, export_configs=export_configs,
+                              default_samples=DEFAULT_VLM_CALIBRATION_SAMPLES, label="TextVQA") as providers:
+        yield providers
+
+
+@contextmanager
+def prepare_text_calibration(model, tokenizer, recipe, *, exporter, export_configs, seed=42):
+    samples = text_calibration_samples(tokenizer, recipe, seed)
+    with _prepare_calibration(model, {"model": recipe}, samples, exporter=exporter, export_configs=export_configs,
+                              default_samples=DEFAULT_TEXT_CALIBRATION_SAMPLES,
+                              label=recipe["dataset"]) as providers:
+        yield providers
+
+
+@contextmanager
+def _prepare_calibration(model, recipes, samples, *, exporter, export_configs, default_samples, label):
     import torch
     from transformers.exporters.decompose import decode_graph_name
     from transformers.exporters.precompute import precompute_export_inputs
@@ -220,7 +283,7 @@ def prepare_textvqa_calibration(model, processor, recipes, *, exporter, export_c
 
     selected = {name: recipe for name, recipe in recipes.items()
                 if recipe is not None and recipe.get("bits", 4) == 4}
-    limits = {name: recipe.get("num_samples", DEFAULT_VLM_CALIBRATION_SAMPLES) for name, recipe in selected.items()}
+    limits = {name: recipe.get("num_samples", default_samples) for name, recipe in selected.items()}
     if not limits:
         yield {}
         return
@@ -229,10 +292,9 @@ def prepare_textvqa_calibration(model, processor, recipes, *, exporter, export_c
     generation_config, multi_token_decode, decoder_writes_cross_cache = exporter._resolve_generation_options(
         model, export_configs, None, None, None,
     )
-    with tempfile.TemporaryDirectory(prefix="hf-textvqa-") as directory:
+    with tempfile.TemporaryDirectory(prefix="hf-calibration-") as directory:
         root = Path(directory)
         paths = {name: [] for name in selected}
-        samples = textvqa_samples(processor, max(limits.values()), seed)
         try:
             with torch.no_grad():
                 for index, sample in enumerate(samples):
@@ -259,11 +321,11 @@ def prepare_textvqa_calibration(model, processor, recipes, *, exporter, export_c
                             torch.save(values, path)
                             paths[name].append(path)
                     del captured, sample
-                    print(f"Prepared TextVQA calibration sample {index + 1}/{max(limits.values())}", flush=True)
+                    print(f"Prepared {label} calibration sample {index + 1}/{max(limits.values())}", flush=True)
         finally:
             samples.close()
         if any(not files for files in paths.values()):
-            raise ValueError("TextVQA calibration produced no samples")
+            raise ValueError(f"{label} calibration produced no samples")
 
         def provider(files):
             def feeds(graph, sample_inputs):
@@ -275,7 +337,7 @@ def prepare_textvqa_calibration(model, processor, recipes, *, exporter, export_c
                             missing = [port.get_any_name() for port in graph.inputs
                                        if not port.get_names().intersection(feed)]
                             if missing:
-                                raise ValueError(f"TextVQA calibration is missing inputs: {sorted(missing)}")
+                                raise ValueError(f"{label} calibration is missing inputs: {sorted(missing)}")
                             yield feed
 
                 return Samples()

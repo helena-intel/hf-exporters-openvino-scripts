@@ -112,6 +112,89 @@ class CompressionConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported compression settings"):
             resolve_int4_config("openai/gpt-oss-20b")
 
+    def test_text_calibration_selects_recipe_dataset_and_closes_stream(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from int4_config import text_calibration_samples
+
+        for name, source, subset in (("wikitext2", "Salesforce/wikitext", "wikitext-2-raw-v1"),
+                                     ("gsm8k", "openai/gsm8k", "main")):
+            with self.subTest(dataset=name):
+                events = []
+
+                def rows():
+                    try:
+                        for index in range(4):
+                            events.append(index)
+                            yield {"text": f"Text {index}", "question": "Question", "answer": "Answer"}
+                    finally:
+                        events.append("closed")
+
+                def shuffle(seed, max_buffer_input_shards=None):
+                    self.assertEqual((seed, max_buffer_input_shards), (17, 1))
+                    return rows()
+
+                tokenizer = Mock(return_value={"input_ids": torch.tensor([[1, 2, 3]])})
+                with patch("datasets.load_dataset", return_value=SimpleNamespace(shuffle=shuffle)) as load:
+                    samples = list(text_calibration_samples(tokenizer, {"dataset": name, "num_samples": 2}, 17))
+                self.assertEqual(len(samples), 2)
+                self.assertEqual(events, [0, 1, "closed"])
+                load.assert_called_once_with(source, subset, split="train", streaming=True)
+                self.assertEqual(tokenizer.call_args.kwargs["max_length"], 128)
+
+    def test_text_calibration_rejects_empty_data_and_closes_on_tokenizer_error(self):
+        from unittest.mock import Mock
+        from int4_config import text_calibration_samples
+
+        tokenizer = Mock(side_effect=RuntimeError("tokenizer failed"))
+        events = []
+
+        def rows():
+            try:
+                yield {"text": "Representative text"}
+            finally:
+                events.append("closed")
+
+        dataset = Mock()
+        dataset.shuffle.return_value = rows()
+        with patch("datasets.load_dataset", return_value=dataset):
+            with self.assertRaisesRegex(RuntimeError, "tokenizer failed"):
+                list(text_calibration_samples(tokenizer, {"dataset": "wikitext2"}))
+        self.assertEqual(events, ["closed"])
+        dataset.shuffle.return_value = iter([{"text": ""}])
+        with patch("datasets.load_dataset", return_value=dataset):
+            with self.assertRaisesRegex(ValueError, "no usable text"):
+                list(text_calibration_samples(tokenizer, {"dataset": "wikitext2"}))
+
+    def test_text_calibration_captures_decoder_feeds_and_cleans_spool(self):
+        from unittest.mock import Mock
+        from int4_config import prepare_text_calibration
+
+        recipe = {"bits": 4, "dataset": "wikitext2", "num_samples": 2}
+        exporter = Mock()
+        exporter._resolve_generation_options.return_value = (None, True, True)
+        events = []
+
+        def samples(*args):
+            try:
+                for index in range(2):
+                    yield {"inputs": torch.tensor([[index]], dtype=torch.float32)}
+            finally:
+                events.append("closed")
+
+        parameter = ov.opset13.parameter([1, 1], name="inputs")
+        graph = ov.Model([parameter], [parameter])
+        graph.inputs[0].get_tensor().set_names({"inputs"})
+        with patch("int4_config.text_calibration_samples", side_effect=samples), \
+                patch("transformers.exporters.quantizers.utils.capture_calibration_inputs",
+                      side_effect=lambda model, samples, **kwargs: {"model": [samples[0], samples[0]]}), \
+                patch("transformers.exporters.precompute.precompute_export_inputs", side_effect=lambda config, inputs: inputs):
+            with prepare_text_calibration(Mock(), Mock(), recipe, exporter=exporter, export_configs={}) as providers:
+                feeds = list(providers["model"](graph, {}))
+        self.assertEqual([float(feed["inputs"][0, 0]) for feed in feeds], [0, 1])
+        self.assertEqual(events, ["closed"])
+        self.assertEqual(make_compression_config({"bits": 4, "dataset": "wikitext2"}).subset_size, 128)
+
     def test_textvqa_stream_limits_and_closes_on_success_and_error(self):
         from unittest.mock import Mock
         from PIL import Image

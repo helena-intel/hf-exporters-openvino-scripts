@@ -12,8 +12,8 @@ def export_model(model_id, output_dir, *, image=None, prompt="Describe this imag
                  calibration_seed=42):
     if calibration_data is not None and calibration_dataset is not None:
         raise ValueError("Choose either --calibration-data or --calibration-dataset")
-    if calibration_dataset not in (None, "textvqa"):
-        raise ValueError("Only the textvqa calibration dataset is currently supported")
+    if calibration_dataset not in (None, "textvqa", "wikitext2", "gsm8k"):
+        raise ValueError("Supported calibration datasets: textvqa, wikitext2, gsm8k")
     if calibration_num_samples is not None and (
             not isinstance(calibration_num_samples, int) or isinstance(calibration_num_samples, bool)
             or calibration_num_samples <= 0):
@@ -26,7 +26,8 @@ def export_model(model_id, output_dir, *, image=None, prompt="Describe this imag
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
     from transformers.exporters import OpenVINOConfig, OpenVINOExporter
     from int4_config import (
-        DEFAULT_VLM_CALIBRATION_SAMPLES, apply_runtime_config, make_quantizer,
+        DEFAULT_TEXT_CALIBRATION_SAMPLES, DEFAULT_VLM_CALIBRATION_SAMPLES, TEXT_CALIBRATION_DATASETS,
+        apply_runtime_config, make_quantizer, prepare_text_calibration,
         prepare_textvqa_calibration, resolve_int4_config,
     )
 
@@ -36,7 +37,7 @@ def export_model(model_id, output_dir, *, image=None, prompt="Describe this imag
         raise ValueError(f"{config.model_type} is not a supported causal LLM or image-text-to-text model")
     if multimodal and image is None:
         raise ValueError(f"{model_id} requires --image with a representative export image")
-    if calibration_dataset is not None and not multimodal:
+    if calibration_dataset == "textvqa" and not multimodal:
         print("TextVQA calibration is only used for image-text models; skipping it for this text model.", flush=True)
         calibration_dataset = None
     if multimodal:
@@ -59,13 +60,15 @@ def export_model(model_id, output_dir, *, image=None, prompt="Describe this imag
             dataset = recipe.get("dataset")
         dataset_backed = bool(dataset) and recipe is not None and recipe.get("bits", 4) == 4
         if dataset_backed and recipe is not None:
-            if dataset != "textvqa" or not multimodal:
+            if not ((dataset == "textvqa" and multimodal) or (dataset in TEXT_CALIBRATION_DATASETS and not multimodal)):
                 raise ValueError(
                     f"Automatic calibration for dataset={dataset!r} is not supported for this model. "
-                    "Only image-text TextVQA is supported; supply --calibration-data with preprocessed .npz inputs."
+                    "Use TextVQA for image-text models or Wikitext2/GSM8K for LLMs, "
+                    "or supply --calibration-data with preprocessed .npz inputs."
                 )
+                default_samples = DEFAULT_VLM_CALIBRATION_SAMPLES if multimodal else DEFAULT_TEXT_CALIBRATION_SAMPLES
             recipe = {**recipe, "dataset": dataset,
-                      "num_samples": calibration_num_samples or recipe.get("num_samples", DEFAULT_VLM_CALIBRATION_SAMPLES)}
+                      "num_samples": calibration_num_samples or recipe.get("num_samples", default_samples)}
             dataset_recipes[name] = recipe
         recipes[name] = recipe
         export_configs[name] = OpenVINOConfig(
@@ -99,9 +102,17 @@ def export_model(model_id, output_dir, *, image=None, prompt="Describe this imag
     exporter = OpenVINOExporter()
     with ExitStack() as stack, torch.no_grad():
         if dataset_recipes:
-            providers = stack.enter_context(prepare_textvqa_calibration(
-            model, processor, dataset_recipes, exporter=exporter, export_configs=export_configs, seed=calibration_seed,
-            ))
+            if multimodal:
+                calibration = prepare_textvqa_calibration(
+                    model, processor, dataset_recipes, exporter=exporter,
+                    export_configs=export_configs, seed=calibration_seed,
+                )
+            else:
+                calibration = prepare_text_calibration(
+                    model, processor, dataset_recipes["model"], exporter=exporter,
+                    export_configs=export_configs, seed=calibration_seed,
+                )
+            providers = stack.enter_context(calibration)
             for name, provider in providers.items():
                 export_configs[name].quantizer = make_quantizer(recipes[name], calibration_samples=provider)
         artifacts = exporter.export_for_generation(model, inputs, export_configs)
@@ -118,7 +129,7 @@ def export_model(model_id, output_dir, *, image=None, prompt="Describe this imag
         json.dumps({"model_id": str(model_id), "transformers": transformers.__version__,
                     "task": "image-text-to-text" if multimodal else "text-generation",
                     "components": recipes,
-                    "calibration": {"dataset": "textvqa", "seed": calibration_seed}
+                    "calibration": {"dataset": next(iter(dataset_recipes.values()))["dataset"], "seed": calibration_seed}
                     if dataset_recipes else None}, indent=2) + "\n", encoding="utf-8",
     )
     print(f"Saved HF generation export to {output_dir}; load with ExportedModel.from_pretrained().", flush=True)
@@ -140,9 +151,9 @@ def main(argv=None):
     parser.add_argument("--int4-config", type=Path)
     calibration = parser.add_mutually_exclusive_group()
     calibration.add_argument("--calibration-data", type=Path)
-    calibration.add_argument("--calibration-dataset", choices=["textvqa"],
+    calibration.add_argument("--calibration-dataset", choices=["textvqa", "wikitext2", "gsm8k"],
                              help="Override the recipe's calibration dataset (default: follow INT4 recipe)")
-    parser.add_argument("--calibration-num-samples", type=int, help="TextVQA images/questions (default: recipe or 32)")
+    parser.add_argument("--calibration-num-samples", type=int, help="Calibration samples (default: recipe, 32 TextVQA, or 128 text)")
     parser.add_argument("--calibration-seed", type=int)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
