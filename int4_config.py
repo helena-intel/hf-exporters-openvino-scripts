@@ -265,16 +265,18 @@ def prepare_textvqa_calibration(model, processor, recipes, *, exporter, export_c
 
 
 @contextmanager
-def prepare_text_calibration(model, tokenizer, recipe, *, exporter, export_configs, seed=42):
+def prepare_text_calibration(model, tokenizer, recipe, *, exporter, export_configs, seed=42,
+                             preserve_attention_mask=False):
     samples = text_calibration_samples(tokenizer, recipe, seed)
     with _prepare_calibration(model, {"model": recipe}, samples, exporter=exporter, export_configs=export_configs,
                               default_samples=DEFAULT_TEXT_CALIBRATION_SAMPLES,
-                              label=recipe["dataset"]) as providers:
+                              label=recipe["dataset"], preserve_attention_mask=preserve_attention_mask) as providers:
         yield providers
 
 
 @contextmanager
-def _prepare_calibration(model, recipes, samples, *, exporter, export_configs, default_samples, label):
+def _prepare_calibration(model, recipes, samples, *, exporter, export_configs, default_samples, label,
+                         preserve_attention_mask=False):
     import torch
     from transformers.exporters.decompose import decode_graph_name
     from transformers.exporters.precompute import precompute_export_inputs
@@ -312,6 +314,8 @@ def _prepare_calibration(model, recipes, samples, *, exporter, export_configs, d
                         if multi_token_decode and name == decode_graph_name(captured):
                             component_inputs = component_inputs[-1:]
                         for step, inputs in enumerate(component_inputs):
+                            if preserve_attention_mask and multi_token_decode and name == decode_graph_name(captured):
+                                inputs = {**inputs, "attention_mask": sample["attention_mask"]}
                             inputs = precompute_export_inputs(model.config, inputs)
                             values = {key: value.detach().cpu().clone()
                                       for key, value in get_leaf_tensors(inputs).items()}

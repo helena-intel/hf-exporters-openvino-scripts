@@ -195,6 +195,99 @@ class CompressionConfigTests(unittest.TestCase):
         self.assertEqual(events, ["closed"])
         self.assertEqual(make_compression_config({"bits": 4, "dataset": "wikitext2"}).subset_size, 128)
 
+    def test_text_calibration_preserves_explicit_mask_only_when_requested(self):
+        from unittest.mock import Mock
+        from int4_config import prepare_text_calibration
+
+        recipe = {"bits": 4, "dataset": "wikitext2", "num_samples": 1}
+        original_mask = torch.tensor([[0, 1, 1]], dtype=torch.long)
+        transformed_mask = torch.zeros((1, 1, 3, 3), dtype=torch.float32)
+        for captured_mask in (None, transformed_mask):
+            for preserve in (False, True):
+                with self.subTest(captured_mask=captured_mask is not None, preserve=preserve):
+                    exporter = Mock()
+                    exporter._resolve_generation_options.return_value = (None, True, True)
+                    captured = {"input_ids": torch.tensor([[0, 2, 3]]), "attention_mask": captured_mask}
+                    expected = original_mask if preserve else captured_mask
+                    parameter = ov.opset13.parameter(
+                        list(expected.shape) if expected is not None else [1, 3],
+                        dtype=ov.Type.i64 if expected is None or expected.dtype == torch.long else ov.Type.f32,
+                        name="attention_mask",
+                    )
+                    graph = ov.Model([parameter], [parameter])
+                    graph.inputs[0].get_tensor().set_names({"attention_mask"})
+
+                    def samples(*args):
+                        yield {"input_ids": captured["input_ids"], "attention_mask": original_mask}
+
+                    with patch("int4_config.text_calibration_samples", side_effect=samples), \
+                            patch("transformers.exporters.quantizers.utils.capture_calibration_inputs",
+                                  return_value={"model": [captured, captured]}), \
+                            patch("transformers.exporters.precompute.precompute_export_inputs",
+                                  side_effect=lambda config, inputs: inputs):
+                        with prepare_text_calibration(
+                            Mock(), Mock(), recipe, exporter=exporter, export_configs={},
+                            preserve_attention_mask=preserve,
+                        ) as providers:
+                            if expected is None:
+                                with self.assertRaisesRegex(ValueError, "missing inputs.*attention_mask"):
+                                    list(providers["model"](graph, {}))
+                            else:
+                                feeds = list(providers["model"](graph, {}))
+                                np.testing.assert_array_equal(feeds[0]["attention_mask"], expected.numpy())
+                    self.assertIs(captured["attention_mask"], captured_mask)
+
+    def test_qwen3_genai_export_with_text_calibration(self):
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+
+        config = Qwen3Config(
+            vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=64,
+            max_position_embeddings=256, bos_token_id=1, eos_token_id=2, pad_token_id=0,
+        )
+        config._attn_implementation = "sdpa"
+        model = Qwen3ForCausalLM(config).eval()
+        backend = Tokenizer(WordLevel({
+            "[PAD]": 0, "[BOS]": 1, "[EOS]": 2, "[UNK]": 3,
+            "Hello": 4, ",": 5, "world": 6, "!": 7,
+        }, unk_token="[UNK]"))
+        backend.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, pad_token="[PAD]", bos_token="[BOS]",
+            eos_token="[EOS]", unk_token="[UNK]",
+        )
+        recipe = {"bits": 4, "sym": False, "group_size": 32, "ratio": 1.0,
+                  "dataset": "wikitext2", "num_samples": 2, "awq": True}
+
+        def samples(*args):
+            for text in ("Hello world!", "Hello world! Hello world!"):
+                yield dict(tokenizer(text, return_tensors="pt"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = ["hf_export_int4.py", "--model-id", "local/tiny-qwen3", "--output-dir", directory]
+            with patch.object(sys, "argv", arguments), \
+                    patch("transformers.AutoModelForCausalLM.from_pretrained", return_value=model), \
+                    patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer), \
+                    patch("int4_config.resolve_int4_config", return_value=recipe), \
+                    patch("int4_config.text_calibration_samples", side_effect=samples):
+                runpy.run_path(str(Path(__file__).with_name("hf_export_int4.py")), run_name="__main__")
+            graph = ov.Core().read_model(Path(directory) / "openvino_model.xml")
+            self.assertTrue(graph.get_variables())
+            self.assertEqual(graph.input("attention_mask").get_partial_shape().rank.get_length(), 2)
+            self.assertTrue(any(
+                node.get_type_name() == "Constant" and node.get_output_element_type(0) in (ov.Type.i4, ov.Type.u4)
+                for node in graph.get_ops()
+            ))
+            compiled = ov.Core().compile_model(graph, "CPU")
+            logits = compiled({
+                "input_ids": np.array([[4, 6, 7]], dtype=np.int64),
+                "position_ids": np.array([[0, 1, 2]], dtype=np.int64),
+                "attention_mask": np.ones((1, 3), dtype=np.int64),
+                "beam_idx": np.array([0], dtype=np.int32),
+            })["logits"]
+            self.assertEqual(logits.shape, (1, 3, 128))
+            self.assertTrue(np.isfinite(logits).all())
+
     def test_textvqa_stream_limits_and_closes_on_success_and_error(self):
         from unittest.mock import Mock
         from PIL import Image

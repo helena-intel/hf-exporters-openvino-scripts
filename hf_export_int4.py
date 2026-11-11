@@ -82,7 +82,7 @@ with ExitStack() as stack:
     if automatic_calibration:
         providers = stack.enter_context(prepare_text_calibration(
             model, tokenizer, compression, exporter=exporter, export_configs={"model": openvino_int4},
-            seed=args.calibration_seed,
+            seed=args.calibration_seed, preserve_attention_mask=True,
         ))
         openvino_int4.quantizer = make_quantizer(compression, calibration_samples=providers["model"])
     ov_model = exporter.export(decode_model, decode_inputs, openvino_int4).program
