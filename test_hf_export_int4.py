@@ -581,6 +581,118 @@ fi
             self.assertEqual(row["throughput_tokens_per_s"], "N/A")
 
 
+class BashLLMBenchmarkRunnerTests(BashBenchmarkRunnerTests):
+    def setUp(self):
+        super().setUp()
+        for name in ("Good, model", "Failure"):
+            for suffix in ("-int4-hf-export-genai", "-hf-export"):
+                (self.root / (name + suffix)).mkdir()
+        self.fixture.write_text(r"""#!/usr/bin/env bash
+set -eu
+if IFS= read -r unexpected; then
+    printf 'Benchmark inherited model-list stdin\n' >&2
+    exit 9
+fi
+model=''
+budget=''
+mode=''
+prompt=''
+while (( $# )); do
+    case "$1" in
+        -m) model=$2; shift 2 ;;
+        -M) budget=$2; shift 2 ;;
+        -p) prompt=$2; shift 2 ;;
+        --disable-thinking|--enable-thinking|--no-chat-template) mode=$1; shift ;;
+        -i|--profile) exit 12 ;;
+        *) shift ;;
+    esac
+done
+printf 'stderr marker\nMode: %s\n' "$mode" >&2
+printf 'Prompt: %s\n' "$prompt"
+case "$model" in
+    *Failure-int4-optimum) printf 'failure marker\n'; exit 7 ;;
+    *Failure-int4-hf-export-genai) printf 'TTFT: 600.00 +/- 2.00 ms\n'; exit 0 ;;
+esac
+case "$model" in
+    *-hf-export) input_label=Input; throughput_label=Throughput:; ttft=2600.00; separator='+/-' ;;
+    *) input_label=Prompt; throughput_label='Throughput :'; ttft=600.00; separator=$(printf '\302\261') ;;
+esac
+printf '%s token size: 100\nOutput token size: %s\n' "$input_label" "$budget"
+printf 'TTFT: %s %s 2.00 ms\nGenerate time: 3000.00 %s 3.00 ms\n' "$ttft" "$separator" "$separator"
+if [[ $budget == 1 ]]; then
+    printf 'TPOT: N/A (fewer than two output tokens)\n%s N/A (fewer than two output tokens)\n' "$throughput_label"
+else
+    printf 'TPOT: 27.00 %s 0.30 ms/token\n%s 37.00 %s 0.40 tokens/s\n' "$separator" "$throughput_label" "$separator"
+fi
+""", encoding="utf-8", newline="\n")
+
+    def run_batch(self, *extra):
+        script = Path(__file__).with_name("run_llm_benchmarks.sh")
+        return subprocess.run([
+            self.bash, script.as_posix(), "--models-file", self.models.as_posix(),
+            "--model-root", self.root.as_posix(),
+            "--output-dir", (self.root / "results directory").as_posix(), "--python", Path(self.bash).as_posix(),
+            "--hf-script", self.fixture.as_posix(), "--genai-script", self.fixture.as_posix(),
+            "--prompt", 'explain, with "quotes"', "-N", "3", "-n", "10", "-M", "4", *extra,
+        ], capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+
+    def test_batch_logs_metrics_and_continues_after_failures(self):
+        result = self.run_batch()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        summary = self.root / "results directory" / "summary.csv"
+        with summary.open(newline="", encoding="utf-8") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual([row["status"] for row in rows],
+                         ["ok", "ok", "ok", "failed", "missing_metrics", "ok",
+                          "missing_model", "missing_model", "missing_model"])
+        self.assertEqual([row["backend"] for row in rows[:3]],
+                         ["optimum", "hf-exporters-genai", "hf-exporters"])
+        for row, suffix, ttft in zip(rows[:3], ("-int4-optimum", "-int4-hf-export-genai", "-hf-export"),
+                                     ("600.00", "600.00", "2600.00")):
+            self.assertEqual(row["model_id"], "org/Good, model")
+            self.assertTrue(row["model_dir"].endswith("Good, model" + suffix))
+            self.assertEqual(row["input_tokens"], "100")
+            self.assertEqual(row["output_tokens"], "4")
+            self.assertEqual(row["ttft_ms"], ttft)
+            self.assertEqual(row["ttft_std_ms"], "2.00")
+            self.assertEqual(row["tpot_ms"], "27.00")
+            self.assertEqual(row["tpot_std_ms"], "0.30")
+            self.assertEqual(row["throughput_tokens_per_s"], "37.00")
+            self.assertEqual(row["throughput_std_tokens_per_s"], "0.40")
+            self.assertEqual(row["generation_ms"], "3000.00")
+            self.assertEqual(row["generation_std_ms"], "3.00")
+        self.assertEqual(rows[3]["exit_code"], "7")
+        logs = list((summary.parent / "logs").glob("*.log"))
+        self.assertEqual(len(logs), 9)
+        successful_logs = [log for log in logs if "Good, model" in log.name]
+        for log in successful_logs:
+            text = log.read_text(encoding="utf-8")
+            self.assertIn("stderr marker", text)
+            self.assertIn("Mode: --disable-thinking", text)
+            self.assertIn('Prompt: explain, with "quotes"', text)
+        saved = summary.read_bytes()
+        self.assertEqual(self.run_batch().returncode, 2)
+        self.assertEqual(summary.read_bytes(), saved)
+
+    def test_one_token_metrics_and_invalid_count(self):
+        self.models.write_text("org/Good, model\n", encoding="utf-8")
+        self.assertEqual(self.run_batch("-n", "0").returncode, 2)
+        result = self.run_batch("-M", "1", "--no-chat-template")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        summary = self.root / "results directory" / "summary.csv"
+        with summary.open(newline="", encoding="utf-8") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["output_tokens"], "1")
+            self.assertEqual(row["tpot_ms"], "N/A")
+            self.assertEqual(row["tpot_std_ms"], "")
+            self.assertEqual(row["throughput_tokens_per_s"], "N/A")
+        for log in (summary.parent / "logs").glob("*.log"):
+            self.assertIn("Mode: --no-chat-template", log.read_text(encoding="utf-8"))
+
+
 class BenchmarkTokenSelectionTests(unittest.TestCase):
     def test_indexed_eos_suppression_matches_minimum_length(self):
         from benchmark_vlm_hf_exporters import SuppressEosLogitsProcessor
