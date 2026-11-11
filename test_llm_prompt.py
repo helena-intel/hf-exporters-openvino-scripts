@@ -1,5 +1,7 @@
 import argparse
+import json
 import runpy
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -75,6 +77,19 @@ class PromptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no chat template"):
             disable_genai_thinking(self.tokenizer)
         self.tokenizer.set_chat_template.assert_not_called()
+
+    def test_genai_without_template_getter_loads_saved_template(self):
+        for filename, contents in (
+            ("chat_template.jinja", "original template"),
+            ("tokenizer_config.json", json.dumps({"chat_template": "original template"})),
+        ):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / filename).write_text(contents, encoding="utf-8")
+                tokenizer = Mock(spec=["set_chat_template"])
+                disable_genai_thinking(tokenizer, directory)
+                tokenizer.set_chat_template.assert_called_once_with(
+                    "{% set enable_thinking = false %}original template",
+                )
 
     def test_genai_inference_defaults_and_overrides(self):
         script = Path(__file__).with_name("inference_llm_genai.py")

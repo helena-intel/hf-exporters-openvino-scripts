@@ -4,7 +4,6 @@
 # source: https://github.com/openvinotoolkit/openvino.genai/blob/master/samples/python/text_generation/benchmark_genai.py
 
 import argparse
-import sys
 
 import openvino_genai as ov_genai
 from openvino import get_version
@@ -49,20 +48,16 @@ def main():
     config.max_new_tokens = args.max_new_tokens
     config.apply_chat_template = not args.no_chat_template
 
-    if device == "NPU":
-        pipe = ov_genai.LLMPipeline(models_path, device)
-    else:
-        scheduler_config = ov_genai.SchedulerConfig()
-        scheduler_config.enable_prefix_caching = False
-        scheduler_config.max_num_batched_tokens = sys.maxsize
-        pipe = ov_genai.LLMPipeline(models_path, device, scheduler_config=scheduler_config)
+    # Sequential requests do not need continuous batching, whose graph rewrites
+    # are not compatible with every native HF stateful export.
+    pipe = ov_genai.LLMPipeline(models_path, device)
 
     tokenizer = pipe.get_tokenizer()
     if config.apply_chat_template:
         if args.disable_thinking:
             try:
-                disable_genai_thinking(tokenizer)
-            except ValueError as error:
+                disable_genai_thinking(tokenizer, models_path)
+            except (ValueError, OSError) as error:
                 parser.error(str(error))
         formatted_prompt = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt[0]}], add_generation_prompt=True,

@@ -326,6 +326,61 @@ class CompressionConfigTests(unittest.TestCase):
             self.assertEqual(logits.shape, (1, 3, 128))
             self.assertTrue(np.isfinite(logits).all())
 
+    def test_llama_genai_cache_batch_is_dynamic(self):
+        import contextlib
+        import io
+        import openvino_genai as ov_genai
+        from transformers import LlamaConfig, LlamaForCausalLM
+        from llm_prompt import disable_genai_thinking
+
+        config = LlamaConfig(
+            vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=128,
+            bos_token_id=1, eos_token_id=2, pad_token_id=0,
+        )
+        config._attn_implementation = "sdpa"
+        model = LlamaForCausalLM(config).eval()
+        backend = Tokenizer(WordLevel({
+            "[PAD]": 0, "[BOS]": 1, "[EOS]": 2, "[UNK]": 3,
+            "Hello": 4, ",": 5, "world": 6, "!": 7,
+        }, unk_token="[UNK]"))
+        backend.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, pad_token="[PAD]", bos_token="[BOS]",
+            eos_token="[EOS]", unk_token="[UNK]",
+            chat_template="{% for message in messages %}{{ message['content'] }}{% endfor %}"
+                          "{% if enable_thinking is defined and not enable_thinking %} Hello{% endif %}",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = ["hf_export_int4.py", "--model-id", "local/tiny-llama", "--output-dir", directory]
+            with patch.object(sys, "argv", arguments), \
+                    patch("transformers.AutoModelForCausalLM.from_pretrained", return_value=model), \
+                    patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer), \
+                    patch("int4_config.make_quantizer", return_value=None):
+                runpy.run_path(str(Path(__file__).with_name("hf_export_int4.py")), run_name="__main__")
+            graph = ov.Core().read_model(Path(directory) / "openvino_model.xml")
+            self.assertTrue(graph.get_variables())
+            for variable in graph.get_variables():
+                self.assertTrue(variable.get_info().data_shape[0].is_dynamic,
+                                str(variable.get_info().data_shape))
+            pipe = ov_genai.LLMPipeline(directory, "CPU")
+            native_tokenizer = pipe.get_tokenizer()
+            disable_genai_thinking(native_tokenizer, directory)
+            text = native_tokenizer.apply_chat_template(
+                [{"role": "user", "content": "Hello world!"}], add_generation_prompt=True,
+            )
+            self.assertEqual(text, "Hello world! Hello")
+            results = pipe.generate(["Hello", "Hello world!"], max_new_tokens=2,
+                                    do_sample=False, apply_chat_template=False, ignore_eos=True)
+            self.assertEqual(len(results.texts), 2)
+            output = io.StringIO()
+            benchmark_arguments = ["benchmark_llm_genai.py", "-m", directory, "-p", "Hello world!",
+                                   "-N", "0", "-n", "1", "-M", "2"]
+            with patch.object(sys, "argv", benchmark_arguments), contextlib.redirect_stdout(output):
+                runpy.run_path(str(Path(__file__).with_name("benchmark_llm_genai.py")), run_name="__main__")
+            self.assertIn("enable_thinking=False requested", output.getvalue())
+            self.assertIn("TTFT:", output.getvalue())
+
     def test_textvqa_stream_limits_and_closes_on_success_and_error(self):
         from unittest.mock import Mock
         from PIL import Image

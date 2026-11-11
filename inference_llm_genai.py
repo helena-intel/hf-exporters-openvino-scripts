@@ -20,8 +20,8 @@ def main():
 	pipe = ov_genai.LLMPipeline(args.model_dir, args.device)
 	if args.disable_thinking and not args.no_chat_template:
 		try:
-			disable_genai_thinking(pipe.get_tokenizer())
-		except ValueError as error:
+			disable_genai_thinking(pipe.get_tokenizer(), args.model_dir)
+		except (ValueError, OSError) as error:
 			parser.error(str(error))
 	print(pipe.generate(args.prompt, max_new_tokens=args.max_new_tokens, do_sample=False,
 						apply_chat_template=not args.no_chat_template))
