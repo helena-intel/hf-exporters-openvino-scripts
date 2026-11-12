@@ -316,6 +316,28 @@ class MediaTests(unittest.TestCase):
         config._attn_implementation = "sdpa"
         return Qwen3_5ForConditionalGeneration(config).eval()
 
+    def test_qwen_decoder_uses_current_decomposition_api(self):
+        adapters = model_adapters(self.qwen_model())
+        decoder, inputs, shapes = cached_decoder(adapters["decoder"], "qwen3_5")
+        self.assertEqual(inputs["position_ids"].shape[0], 3)
+        self.assertEqual(inputs["attention_mask"].ndim, 2)
+        with tempfile.TemporaryDirectory() as directory:
+            graph = export_component(
+                decoder, inputs, Path(directory) / "decoder.xml", shapes,
+                stateful=True, quantize=False,
+            )
+            self.assertTrue(graph.get_variables())
+            compiled = ov.Core().compile_model(graph, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
+            flattened = get_leaf_tensors(inputs)
+            feeds = {
+                port.get_any_name(): np.arange(inputs["inputs_embeds"].shape[0], dtype=np.int32)
+                if port.get_any_name() == "beam_idx" else flattened[port.get_any_name()].detach().numpy()
+                for port in compiled.inputs
+            }
+            actual = compiled(feeds)["logits"]
+            self.assertEqual(actual.shape[0], inputs["inputs_embeds"].shape[0])
+            self.assertTrue(np.isfinite(actual).all())
+
     def test_qwen_vision_and_embeddings(self):
         adapters = model_adapters(self.qwen_model())
         self.assertEqual(set(adapters), {"decoder", "embeddings", "vision"})

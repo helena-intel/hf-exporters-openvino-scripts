@@ -53,12 +53,13 @@ def gemma_decoder_sample(model):
 
 def qwen_decoder_sample(model):
     import torch
-    from transformers.exporters.utils import decompose_for_generation, get_leaf_tensors
+    from transformers.exporters.decompose import decompose_for_generation
+    from transformers.exporters.utils import get_leaf_tensors
 
     components = decompose_for_generation(
         model, {"input_ids": torch.tensor([[2, 3, 4, 5]] * 2)}, multi_token_decode=True,
     )
-    _, captured = components["decode"]
+    captured = components["model"].inputs
     ids = captured["input_ids"]
     batch, length = ids.shape
     past = captured["past_key_values"].get_seq_length()
