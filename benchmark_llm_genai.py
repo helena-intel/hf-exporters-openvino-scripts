@@ -46,6 +46,7 @@ def main():
 
     config = ov_genai.GenerationConfig()
     config.max_new_tokens = args.max_new_tokens
+    config.min_new_tokens = args.max_new_tokens
     config.apply_chat_template = not args.no_chat_template
 
     # Sequential requests do not need continuous batching, whose graph rewrites

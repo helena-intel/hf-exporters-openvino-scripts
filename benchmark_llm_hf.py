@@ -47,7 +47,7 @@ def generate(model, tokenizer, prompt, *, max_new_tokens=20, disable_thinking=Tr
     inputs = tokenizer(text, return_tensors="pt", **({"add_special_tokens": False} if templated else {}))
     tokenization_s = perf_counter() - started
     generation = copy.deepcopy(model.generation_config)
-    generation.update(max_new_tokens=max_new_tokens, min_new_tokens=None, min_length=0,
+    generation.update(max_new_tokens=max_new_tokens, min_new_tokens=max_new_tokens, min_length=0,
                       do_sample=False, num_beams=1, num_return_sequences=1, use_cache=True,
                       return_dict_in_generate=False, output_scores=False, output_logits=False)
     timer = TokenTimer()

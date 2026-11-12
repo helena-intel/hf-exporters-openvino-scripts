@@ -4,13 +4,13 @@ export LC_ALL=C
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 models_file="$script_dir/models_llm.txt"
-model_root=.
+model_root=models
 output_dir="benchmark_results/llm_$(date +%Y%m%d_%H%M%S)_$$"
 prompt='Why is the sky blue?'
 device=CPU
-num_warmup=3
-num_iter=10
-max_new_tokens=256
+num_warmup=1
+num_iter=3
+max_new_tokens=512
 hf_python=${HF_PYTHON:-${PYTHON:-python}}
 genai_python=${GENAI_PYTHON:-${PYTHON:-python}}
 hf_script="$script_dir/benchmark_llm_hf.py"
@@ -32,8 +32,8 @@ usage() {
         '  -p, --prompt TEXT        Prompt (default: Why is the sky blue?)' \
         '  -d, --device DEVICE      OpenVINO device (default: CPU)' \
         '  -N, --num-warmup COUNT   Warmups per benchmark (default: 3)' \
-        '  -n, --num-iter COUNT     Measured runs per benchmark (default: 10)' \
-        '  -M, --max-new-tokens N   Output token budget (default: 256)' \
+        '  -n, --num-iter COUNT     Measured runs per benchmark (default: 3)' \
+        '  -M, --max-new-tokens N   Output token budget (default: 1024)' \
         '  --python PATH           Python executable for all variants (default: python)' \
         '  --hf-python PATH        Override native HF Python executable' \
         '  --genai-python PATH     Override Python for both GenAI variants' \
