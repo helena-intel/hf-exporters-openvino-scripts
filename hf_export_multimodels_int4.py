@@ -298,7 +298,7 @@ def export_model(model_id, output_dir, image_path, *, group_size=None, ratio=Non
             "grid_thw": processed["image_grid_thw"],
         }
     model = AutoModelForImageTextToText.from_pretrained(
-        model_id, config=config, attn_implementation="sdpa",
+        model_id, config=config, dtype=torch.float32, attn_implementation="sdpa",
     ).eval()
     adapters = model_adapters(model)
     output_dir = Path(output_dir)

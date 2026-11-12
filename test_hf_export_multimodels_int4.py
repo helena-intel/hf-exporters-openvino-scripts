@@ -175,6 +175,7 @@ class MediaTests(unittest.TestCase):
     def test_custom_component_compression(self):
         import json
         from PIL import Image
+        from transformers import AutoModelForImageTextToText
 
         model = self.gemma_model()
         positions = torch.tensor([[column, row] for row in range(4) for column in range(4)])
@@ -190,6 +191,13 @@ class MediaTests(unittest.TestCase):
             "vision_embeddings_model": {"bits": 8, "sym": True, "weight_only": True},
         }
         with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "bf16-checkpoint"
+            model.to(torch.bfloat16).save_pretrained(checkpoint)
+            original_load = AutoModelForImageTextToText.from_pretrained
+
+            def load_checkpoint(model_id, **kwargs):
+                return original_load(checkpoint, **kwargs)
+
             image = Path(directory) / "image.png"
             Image.new("RGB", (8, 8)).save(image)
             config_path = Path(directory) / "recipes.json"
@@ -199,8 +207,10 @@ class MediaTests(unittest.TestCase):
             output = Path(directory) / "export"
             with patch("transformers.AutoConfig.from_pretrained", return_value=model.config), \
                     patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
-                    patch("transformers.AutoModelForImageTextToText.from_pretrained", return_value=model):
+                    patch("transformers.AutoModelForImageTextToText.from_pretrained",
+                          side_effect=load_checkpoint) as load:
                 export_model("local/tiny-gemma", output, image, int4_config=config_path)
+            self.assertEqual(load.call_args.kwargs.get("dtype"), torch.float32)
             manifest = json.loads((output / "export_manifest.json").read_text())
             self.assertTrue(manifest["compression"]["decoder"]["sym"])
             self.assertEqual(manifest["compression"]["decoder"]["group_size"], 32)
@@ -317,6 +327,9 @@ class MediaTests(unittest.TestCase):
         return Qwen3_5ForConditionalGeneration(config).eval()
 
     def test_qwen_decoder_uses_current_decomposition_api(self):
+        previous_threads = torch.get_num_threads()
+        self.addCleanup(torch.set_num_threads, previous_threads)
+        torch.set_num_threads(1)
         adapters = model_adapters(self.qwen_model())
         decoder, inputs, shapes = cached_decoder(adapters["decoder"], "qwen3_5")
         self.assertEqual(inputs["position_ids"].shape[0], 3)
@@ -328,7 +341,12 @@ class MediaTests(unittest.TestCase):
             )
             self.assertTrue(graph.get_variables())
             compiled = ov.Core().compile_model(graph, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
-            flattened = get_leaf_tensors(inputs)
+            batch, length = inputs["inputs_embeds"].shape[:2]
+            flattened = get_leaf_tensors({
+                **inputs,
+                "attention_mask": torch.ones((batch, length), dtype=torch.long),
+                "position_ids": torch.arange(length).view(1, 1, length).expand(3, batch, length),
+            })
             feeds = {
                 port.get_any_name(): np.arange(inputs["inputs_embeds"].shape[0], dtype=np.int32)
                 if port.get_any_name() == "beam_idx" else flattened[port.get_any_name()].detach().numpy()
@@ -337,6 +355,44 @@ class MediaTests(unittest.TestCase):
             actual = compiled(feeds)["logits"]
             self.assertEqual(actual.shape[0], inputs["inputs_embeds"].shape[0])
             self.assertTrue(np.isfinite(actual).all())
+
+    def test_qwen_inference_prepares_vision_inputs_from_config(self):
+        from inference_vlm_hf import OpenVINOVLM
+        from transformers.exporters.utils import precompute_export_inputs
+
+        runner = OpenVINOVLM.__new__(OpenVINOVLM)
+        runner.config = self.qwen_model().config
+        runner.family = "qwen3_5"
+        runner.image_grid_thw = [[1, 4, 4]]
+        runner.vision_shapes = {}
+        runner.vision = Mock()
+        runner.embeddings = Mock()
+        processed = {
+            "input_ids": torch.tensor([[2, 252, 250, 250, 250, 250, 3, 4]]),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([[0, 0, 1, 1, 1, 1, 0, 0]]),
+            "pixel_values": torch.randn(16, 24),
+            "image_grid_thw": torch.tensor(runner.image_grid_thw),
+        }
+        expected = precompute_export_inputs(runner.config.vision_config, {
+            "hidden_states": processed["pixel_values"], "grid_thw": processed["image_grid_thw"],
+        })
+        with patch("inference_vlm_hf.infer", side_effect=[
+            {"image_features": np.ones((4, 128), np.float32)},
+            {"inputs_embeds": np.zeros((1, 8, 128), np.float32)},
+        ]) as infer_request:
+            feeds, next_position, _ = runner.prepare_inputs(processed)
+        vision_inputs = infer_request.call_args_list[0].args[1]
+        self.assertIn("cu_seqlens", vision_inputs)
+        self.assertEqual(set(vision_inputs), set(expected))
+        for name, value in expected.items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(vision_inputs[name], value)
+            else:
+                self.assertEqual(vision_inputs[name], value)
+        np.testing.assert_array_equal(feeds["inputs_embeds"][0, 2:6], np.ones((4, 128), np.float32))
+        self.assertEqual(feeds["position_ids"].shape, (3, 1, 8))
+        self.assertGreater(next_position, 0)
 
     def test_qwen_vision_and_embeddings(self):
         adapters = model_adapters(self.qwen_model())

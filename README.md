@@ -112,9 +112,11 @@ See [INT4_CONFIGS.md](INT4_CONFIGS.md) for lookup and component mappings.
 - Qwen3.5's native runtime may prefill one token at a time because its
   linear-attention prefill/decode paths differ. This affects TTFT relative to
   Optimum/GenAI; requesting dynamic shapes does not fix that runtime path.
-- The unified exporter defaults to FP32 loading, with FP16/BF16 options. Match
-  loading and execution precision explicitly when comparing with Optimum.
-  Full-size FP32 loading can require substantial host memory.
+- The unified exporter defaults to FP32 loading, with FP16/BF16 options. The
+  legacy component exporter explicitly loads FP32, avoiding implicit mixed/BF16
+  checkpoint loading during tracing. Match loading and execution precision
+  explicitly when comparing with Optimum. FP32 weights require approximately
+  twice the memory of BF16 weights before compression, plus export overhead.
 - Stateful KV caches are required. The GenAI LLM script supplies a dynamic 2D
   attention mask and FP32 logits, but does not support every cache layout.
 - A Phi-3 workaround clears sliding windows at least as large as the maximum

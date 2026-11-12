@@ -109,14 +109,12 @@ class OpenVINOVLM:
             next_position = ids.shape[1]
         else:
             from transformers.exporters.utils import precompute_export_inputs
-            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5VisionModel
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
 
             embedding_ids = ids
             vision_inputs = {"hidden_states": processed["pixel_values"],
                              "grid_thw": processed["image_grid_thw"]}
-            with torch.device("meta"):
-                metadata = Qwen3_5VisionModel(self.config.vision_config)
-            precompute_export_inputs(metadata, vision_inputs)
+            vision_inputs = precompute_export_inputs(self.config.vision_config, vision_inputs)
             metadata = SimpleNamespace(config=self.config)
             metadata.get_vision_position_ids = MethodType(Qwen3_5Model.get_vision_position_ids, metadata)
             get_rope_index = MethodType(Qwen3_5Model.get_rope_index, metadata)
