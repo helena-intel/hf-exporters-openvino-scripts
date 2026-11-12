@@ -184,7 +184,18 @@ class OpenVINOVLM:
         preparation_timings = {}
         feeds, next_position, vision_seconds = self.prepare_inputs(processed, timings=preparation_timings)
         prepared = perf_counter()
-        logits = infer(self.decoder, feeds, copy_outputs=False)["logits"]
+        if self.family == "qwen3_5":
+            for position in range(feeds["inputs_embeds"].shape[1]):
+                prefill_feeds = {
+                    **feeds,
+                    "inputs_embeds": feeds["inputs_embeds"][:, position:position + 1],
+                    "position_ids": feeds["position_ids"][:, :, position:position + 1],
+                    "attention_mask": feeds["attention_mask"][:, :position + 1],
+                    "mm_token_type_ids": feeds["mm_token_type_ids"][:, :position + 1],
+                }
+                logits = infer(self.decoder, prefill_feeds, copy_outputs=False)["logits"]
+        else:
+            logits = infer(self.decoder, feeds, copy_outputs=False)["logits"]
         prefill_seconds = perf_counter() - prepared
         token_ids = []
         token_times = []

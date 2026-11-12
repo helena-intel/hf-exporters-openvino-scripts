@@ -112,6 +112,11 @@ See [INT4_CONFIGS.md](INT4_CONFIGS.md) for lookup and component mappings.
 - Qwen3.5's native runtime may prefill one token at a time because its
   linear-attention prefill/decode paths differ. This affects TTFT relative to
   Optimum/GenAI; requesting dynamic shapes does not fix that runtime path.
+  The legacy component exporter now also exports a single-token Qwen decoder,
+  and its inference runner prefills token by token. The previous multi-token
+  graph failed at `view_11` when prompts crossed 64-token chunk boundaries.
+  Re-export older Qwen component packages to use the single-token decoder;
+  token-by-token prefill is slower than a working chunked prefill implementation.
 - The unified exporter defaults to FP32 loading, with FP16/BF16 options. The
   legacy component exporter explicitly loads FP32, avoiding implicit mixed/BF16
   checkpoint loading during tracing. Match loading and execution precision
@@ -121,6 +126,33 @@ See [INT4_CONFIGS.md](INT4_CONFIGS.md) for lookup and component mappings.
   attention mask and FP32 logits, but does not support every cache layout.
 - A Phi-3 workaround clears sliding windows at least as large as the maximum
   position range. Model-specific workarounds are not general exporter fixes.
+
+### Why Qwen3.5 Prefill Differs From Optimum
+
+Qwen3.5's PyTorch chunked linear-attention implementation uses 64-token chunks
+and a Python `for i in range(num_chunks)` loop. Our previous multi-token export
+used a short sample containing one chunk. The exported graph retained
+sample-specific chunk assumptions despite dynamic input dimensions. Longer
+prompts required more chunks and failed at the `view_11` reshape. A 129-token
+prompt reproduced this locally; the earlier short-prompt test missed that
+boundary. This also reproduced without quantization, so INT4 was not the cause.
+
+The inspected Optimum-Intel implementation handles this with model-specific
+export logic: `Qwen3_5ModelPatcher` replaces the linear-attention forward path,
+and a custom `RecurrentAttentionCell` is converted into an OpenVINO `Loop`.
+Its trip count comes from the runtime sequence length, avoiding the traced
+Python chunk loop. It can therefore accept a multi-token prompt while carrying
+out the recurrence inside the graph, rather than issuing one inference request
+per prompt token from Python.
+
+Our current legacy-component workaround instead exports a single-token decoder
+and prefills token by token from Python. Local 65- and 129-token tests, followed
+by a decode step, matched PyTorch token choices. This fixes the tested reshape
+failure but adds host dispatch overhead and can substantially increase TTFT.
+Older Qwen component packages must be re-exported. Matching Optimum's approach
+requires an exportable dynamic recurrence or equivalent custom conversion;
+enabling dynamic shapes alone is insufficient. Full-checkpoint performance and
+quality parity remain unverified.
 
 ## Package and GenAI Limitations
 

@@ -327,6 +327,8 @@ class MediaTests(unittest.TestCase):
         return Qwen3_5ForConditionalGeneration(config).eval()
 
     def test_qwen_decoder_uses_current_decomposition_api(self):
+        from inference_vlm_hf import OpenVINOVLM
+
         previous_threads = torch.get_num_threads()
         self.addCleanup(torch.set_num_threads, previous_threads)
         torch.set_num_threads(1)
@@ -334,6 +336,7 @@ class MediaTests(unittest.TestCase):
         decoder, inputs, shapes = cached_decoder(adapters["decoder"], "qwen3_5")
         self.assertEqual(inputs["position_ids"].shape[0], 3)
         self.assertEqual(inputs["attention_mask"].ndim, 2)
+        self.assertEqual(inputs["inputs_embeds"].shape[1], 1)
         with tempfile.TemporaryDirectory() as directory:
             graph = export_component(
                 decoder, inputs, Path(directory) / "decoder.xml", shapes,
@@ -341,20 +344,50 @@ class MediaTests(unittest.TestCase):
             )
             self.assertTrue(graph.get_variables())
             compiled = ov.Core().compile_model(graph, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
-            batch, length = inputs["inputs_embeds"].shape[:2]
-            flattened = get_leaf_tensors({
-                **inputs,
-                "attention_mask": torch.ones((batch, length), dtype=torch.long),
-                "position_ids": torch.arange(length).view(1, 1, length).expand(3, batch, length),
-            })
-            feeds = {
-                port.get_any_name(): np.arange(inputs["inputs_embeds"].shape[0], dtype=np.int32)
-                if port.get_any_name() == "beam_idx" else flattened[port.get_any_name()].detach().numpy()
-                for port in compiled.inputs
-            }
-            actual = compiled(feeds)["logits"]
-            self.assertEqual(actual.shape[0], inputs["inputs_embeds"].shape[0])
-            self.assertTrue(np.isfinite(actual).all())
+            embeddings_graph = export_component(
+                adapters["embeddings"], {"input_ids": torch.tensor([[2, 3]])},
+                Path(directory) / "embeddings.xml", {"input_ids": {1: torch.export.Dim.AUTO}},
+                quantize=False,
+            )
+            runner = OpenVINOVLM.__new__(OpenVINOVLM)
+            runner.family = "qwen3_5"
+            runner.eos_ids = set()
+            runner.decoder = compiled.create_infer_request()
+            runner.embeddings = ov.Core().compile_model(embeddings_graph, "CPU").create_infer_request()
+            for length in (65, 129):
+                with self.subTest(prompt_length=length):
+                    embeds = inputs["inputs_embeds"][:1].repeat(1, length, 1).detach()
+                    positions = torch.arange(length).view(1, 1, length).expand(3, 1, length)
+                    mask = torch.ones((1, length), dtype=torch.long)
+                    feeds = {
+                        "inputs_embeds": embeds.numpy(), "position_ids": positions.numpy(),
+                        "attention_mask": mask.numpy(), "mm_token_type_ids": np.zeros((1, length), np.int64),
+                        "beam_idx": np.array([0], np.int32),
+                    }
+                    runner.prepare_inputs = Mock(return_value=(feeds, length, 0.0))
+
+                    def prepare(processed, *, timings):
+                        timings["text_embedding_s"] = 0.0
+                        return feeds, length, 0.0
+
+                    runner.prepare_inputs.side_effect = prepare
+                    with torch.no_grad():
+                        reference = adapters["decoder"](
+                            inputs_embeds=embeds, position_ids=positions, attention_mask=mask,
+                            use_cache=True, return_dict=True, logits_to_keep=1,
+                        )
+                        first = int(reference.logits[0, -1].argmax())
+                        reference = adapters["decoder"](
+                            input_ids=torch.tensor([[first]]),
+                            position_ids=torch.full((3, 1, 1), length, dtype=torch.long),
+                            attention_mask=torch.ones((1, length + 1), dtype=torch.long),
+                            past_key_values=reference.past_key_values,
+                            use_cache=True, return_dict=True, logits_to_keep=1,
+                        )
+                        expected = [first, int(reference.logits[0, -1].argmax())]
+                    result = runner.generate_processed({"input_ids": torch.ones((1, length), dtype=torch.long)},
+                                                       max_new_tokens=2, decode_text=False)
+                    self.assertEqual(result["token_ids"], expected)
 
     def test_qwen_inference_prepares_vision_inputs_from_config(self):
         from inference_vlm_hf import OpenVINOVLM

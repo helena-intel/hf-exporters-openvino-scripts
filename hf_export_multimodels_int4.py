@@ -57,7 +57,7 @@ def qwen_decoder_sample(model):
     from transformers.exporters.utils import get_leaf_tensors
 
     components = decompose_for_generation(
-        model, {"input_ids": torch.tensor([[2, 3, 4, 5]] * 2)}, multi_token_decode=True,
+        model, {"input_ids": torch.tensor([[2, 3, 4, 5]] * 2)}, multi_token_decode=False,
     )
     captured = components["model"].inputs
     ids = captured["input_ids"]
@@ -79,11 +79,11 @@ def qwen_decoder_sample(model):
     }
     automatic = torch.export.Dim.AUTO
     shapes = {
-        "inputs_embeds": {0: automatic, 1: automatic},
-        "position_ids": {1: automatic, 2: automatic},
+        "inputs_embeds": {0: automatic},
+        "position_ids": {1: automatic},
         "attention_mask": {
-            "full_attention": {0: automatic, 2: automatic, 3: automatic},
-            "linear_attention": {0: automatic, 1: automatic},
+            "full_attention": {0: automatic, 3: automatic},
+            "linear_attention": {0: automatic},
         },
         "past_key_values": [
             {0: automatic, 2: automatic} if name.endswith((".keys", ".values"))
