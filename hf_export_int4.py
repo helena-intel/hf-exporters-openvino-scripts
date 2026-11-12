@@ -30,10 +30,13 @@ parser.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
 parser.add_argument("--group-size", type=int, choices=[-1, 32, 64, 128])
 parser.add_argument("--ratio", type=float)
 parser.add_argument("--int4-config", type=Path, help="Override the local per-model INT4 recipes")
-parser.add_argument("--output-dir", type=Path, default=Path("hf_exporters_model_int4"))
+parser.add_argument("--output-dir", type=Path,
+                    help="Output directory (default: <model-basename>-int4-hf-export-genai)")
 parser.add_argument("--tokenizer-only", action="store_true",
                     help="Convert and save GenAI tokenizer IRs without loading or exporting model weights")
 args = parser.parse_args()
+if args.output_dir is None:
+    args.output_dir = Path(f"{Path(args.model_id).name}-int4-hf-export-genai")
 if args.tokenizer_only:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     export_tokenizer(AutoTokenizer.from_pretrained(args.model_id), args.output_dir)

@@ -20,6 +20,50 @@ from int4_config import DEFAULT_CONFIG_PATH, make_compression_config, make_quant
 
 
 class CompressionConfigTests(unittest.TestCase):
+    def test_single_model_default_export_suffixes_and_overrides(self):
+        from contextlib import chdir
+        from unittest.mock import MagicMock, Mock
+        import hf_export_llm
+
+        for override in (None, "custom-output"):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as directory, chdir(directory):
+                tokenizer = Mock(chat_template=None)
+                tokenizer.return_value = {"input_ids": torch.tensor([[1]])}
+                tokenizer.decode.return_value = "generated"
+                arguments = ["hf_export_llm.py", "--model-id", "org/Example"]
+                if override is not None:
+                    arguments.extend(["--output-dir", override])
+                artifacts = MagicMock()
+                runtime = Mock()
+                runtime.generate.return_value = torch.tensor([[1, 2]])
+                with patch.object(sys, "argv", arguments), \
+                        patch.object(hf_export_llm, "make_quantizer", return_value=None), \
+                        patch.object(hf_export_llm.AutoTokenizer, "from_pretrained", return_value=tokenizer), \
+                        patch.object(hf_export_llm.AutoModelForCausalLM, "from_pretrained"), \
+                        patch.object(hf_export_llm, "OpenVINOExporter") as exporter, \
+                        patch.object(hf_export_llm.ExportedModel, "from_pretrained", return_value=runtime) as load:
+                    exporter.return_value.export_for_generation.return_value = artifacts
+                    hf_export_llm.main()
+                expected = Path(override or "Example-int4-hf-export")
+                artifacts.save_pretrained.assert_called_once_with(expected)
+                tokenizer.save_pretrained.assert_called_once_with(expected)
+                load.assert_called_once_with(expected, device="cpu")
+
+                arguments = ["hf_export_int4.py", "--model-id", "org/Example", "--tokenizer-only"]
+                if override is not None:
+                    arguments.extend(["--output-dir", override])
+                parameter = ov.opset13.parameter([1], name="input")
+                graph = ov.Model([parameter], [parameter])
+                with patch.object(sys, "argv", arguments), \
+                        patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer), \
+                        patch("openvino_tokenizers.convert_tokenizer", return_value=(graph, graph)), \
+                        self.assertRaises(SystemExit) as result:
+                    runpy.run_path(str(Path(__file__).with_name("hf_export_int4.py")), run_name="__main__")
+                self.assertEqual(result.exception.code, 0)
+                expected = Path(override or "Example-int4-hf-export-genai")
+                self.assertTrue((expected / "openvino_tokenizer.xml").is_file())
+                self.assertTrue((expected / "openvino_detokenizer.xml").is_file())
+
     def test_data_free_recipe_preserves_awq_without_calibration_settings(self):
         from int4_config import data_free_config
 

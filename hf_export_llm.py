@@ -15,10 +15,13 @@ from int4_config import (
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--output-dir", type=Path, default=Path("hf_exporters_llm_int4"))
+    parser.add_argument("--output-dir", type=Path,
+                        help="Output directory (default: <model-basename>-int4-hf-export)")
     parser.add_argument("--prompt", default="What is OpenVINO?")
     parser.add_argument("--max-new-tokens", type=int, default=100)
     args = parser.parse_args()
+    if args.output_dir is None:
+        args.output_dir = Path(f"{Path(args.model_id).name}-int4-hf-export")
     if not args.prompt.strip() or args.max_new_tokens < 1:
         parser.error("The prompt must not be empty and --max-new-tokens must be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):

@@ -218,10 +218,11 @@ intentionally updates tokenizer artifacts in an existing package.
   not flush OS caches or standardize all backend defaults. Failed/missing models
   are recorded and the batch continues. The VLM list includes a text-only model.
 
-LLM runner defaults distinguish Optimum/GenAI (`-int4-optimum`), native-export/
-GenAI (`-int4-hf-export-genai`), and native HF (`-hf-export`) directories.
-The unified exporter instead defaults to `-int4-hf-export`; override the runner
-suffix when needed. Supply the LLM runner's `models_llm.txt` locally. VLM runners
+Bash LLM runner defaults distinguish Optimum/GenAI (`-int4-optimum`), native-export/
+GenAI (`-int4-hf-export-genai`), and native HF (`-int4-hf-export`) directories.
+The INT4 exporters default to `<model-basename>-int4-hf-export-genai` for GenAI
+or `<model-basename>-int4-hf-export` for native HF. Explicit output-directory
+overrides remain supported. Supply the LLM runner's `models_llm.txt` locally. VLM runners
 compare Optimum and native HF exports. Bash runners require Bash, awk, and tee;
 native PowerShell counterparts are also provided.
 

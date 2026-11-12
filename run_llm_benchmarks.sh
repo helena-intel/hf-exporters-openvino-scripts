@@ -7,6 +7,8 @@ models_file="$script_dir/models_llm.txt"
 model_root=models
 output_dir="benchmark_results/llm_$(date +%Y%m%d_%H%M%S)_$$"
 prompt='Why is the sky blue?'
+prompt_file=''
+prompt_set=0
 device=CPU
 num_warmup=1
 num_iter=3
@@ -30,6 +32,7 @@ usage() {
         '  --hf-genai-suffix TEXT   HF/GenAI directory suffix (default: -int4-hf-export-genai)' \
         '  --hf-suffix TEXT         Native HF directory suffix (default: -hf-export)' \
         '  -p, --prompt TEXT        Prompt (default: Why is the sky blue?)' \
+        '  -F, --prompt-file PATH   Read prompt from file (mutually exclusive with --prompt)' \
         '  -d, --device DEVICE      OpenVINO device (default: CPU)' \
         '  -N, --num-warmup COUNT   Warmups per benchmark (default: 3)' \
         '  -n, --num-iter COUNT     Measured runs per benchmark (default: 3)' \
@@ -58,7 +61,7 @@ while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --disable-thinking|--enable-thinking|--no-chat-template) prompt_mode=$1; shift ;;
-        --models-file|--model-root|--output-dir|--optimum-suffix|--hf-genai-suffix|--hf-suffix|-p|--prompt|-d|--device|-N|--num-warmup|-n|--num-iter|-M|--max-new-tokens|--python|--hf-python|--genai-python|--hf-script|--genai-script)
+        --models-file|--model-root|--output-dir|--optimum-suffix|--hf-genai-suffix|--hf-suffix|-p|--prompt|-F|--prompt-file|-d|--device|-N|--num-warmup|-n|--num-iter|-M|--max-new-tokens|--python|--hf-python|--genai-python|--hf-script|--genai-script)
             require_value "$@"
             case "$1" in
                 --models-file) models_file=$2 ;;
@@ -67,7 +70,8 @@ while (( $# )); do
                 --optimum-suffix) optimum_suffix=$2 ;;
                 --hf-genai-suffix) hf_genai_suffix=$2 ;;
                 --hf-suffix) hf_suffix=$2 ;;
-                -p|--prompt) prompt=$2 ;;
+                -p|--prompt) prompt=$2; prompt_set=1 ;;
+                -F|--prompt-file) prompt_file=$2 ;;
                 -d|--device) device=$2 ;;
                 -N|--num-warmup) num_warmup=$2 ;;
                 -n|--num-iter) num_iter=$2 ;;
@@ -86,7 +90,12 @@ done
 
 [[ -f $models_file ]] || die "Model list not found: $models_file"
 [[ -d $model_root ]] || die "Model root not found: $model_root"
-[[ -n ${prompt//[[:space:]]/} ]] || die 'Prompt must not be empty'
+if [[ -n $prompt_file ]]; then
+    (( prompt_set == 0 )) || die 'Cannot specify both --prompt and --prompt-file'
+    [[ -f $prompt_file && -r $prompt_file ]] || die "Prompt file not found or unreadable: $prompt_file"
+else
+    [[ -n ${prompt//[[:space:]]/} ]] || die 'Prompt must not be empty'
+fi
 [[ $num_warmup =~ ^(0|[1-9][0-9]*)$ ]] || die 'Warmups must be a nonnegative integer'
 [[ $num_iter =~ ^[1-9][0-9]*$ ]] || die 'Iterations must be a positive integer'
 [[ $max_new_tokens =~ ^[1-9][0-9]*$ ]] || die 'Output token budget must be a positive integer'
@@ -127,7 +136,11 @@ run_benchmark() {
     local input_tokens='' output_tokens='' ttft='' ttft_std='' tpot='' tpot_std=''
     local throughput='' throughput_std='' generation='' generation_std=''
     local -a pipeline_status=(0 0)
-    local -a command=("$python" -u "$benchmark_script" -m "$model_dir" -p "$prompt"
+    local -a prompt_args=(-p "$prompt")
+    if [[ -n $prompt_file ]]; then
+        prompt_args=(-F "$prompt_file")
+    fi
+    local -a command=("$python" -u "$benchmark_script" -m "$model_dir" "${prompt_args[@]}"
                      -d "$device" -N "$num_warmup" -n "$num_iter" -M "$max_new_tokens" "$prompt_mode")
     printf '\n[%s] %s\n' "$backend" "$model_id"
     {
