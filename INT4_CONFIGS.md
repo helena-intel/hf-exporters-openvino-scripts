@@ -151,6 +151,14 @@ INT4 components, not per-channel INT8 components.
 
 ## Multimodal Components
 
+When expanding a flat recipe or generic defaults for a VLM, the decoder keeps
+the requested compression settings, while text embeddings and vision components
+use symmetric INT8 weight compression. INT4-only group-size/ratio overrides and
+decoder calibration settings do not propagate to these INT8 components.
+Explicit pipeline recipes instead retain their component settings and
+`default_config`; missing components without a default and explicit `null`
+components remain uncompressed. This policy does not change text-only LLM exports.
+
 Optimum-style `quantization_configs` entries are mapped as follows:
 
 | Exported component | Recipe key |

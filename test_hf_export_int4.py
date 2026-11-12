@@ -56,12 +56,58 @@ class CompressionConfigTests(unittest.TestCase):
             (model_path / "config.json").write_text(json.dumps({"_name_or_path": "org/Model"}))
             self.assertTrue(resolve_int4_config(model_path, path)["sym"])
             self.assertEqual(resolve_int4_config("org/Unknown", path)["group_size"], 128)
-            self.assertIsNone(resolve_int4_config("org/Unknown", path, component="embeddings"))
+            for model_id in ("org/Model", "org/Unknown"):
+                for component in ("embeddings", "vision"):
+                    with self.subTest(model_id=model_id, component=component):
+                        recipe = resolve_int4_config(model_id, path, component=component,
+                                                     group_size=32, ratio=0.6)
+                        self.assertEqual(recipe, {"bits": 8, "sym": True})
+                        self.assertEqual(make_compression_config(recipe).mode.value, "int8_sym")
             missing = Path(directory) / "missing.json"
             with self.assertRaises(FileNotFoundError):
                 resolve_int4_config("org/Model", missing)
             with patch("int4_config.DEFAULT_CONFIG_PATH", missing):
                 self.assertEqual(resolve_int4_config("org/Unknown")["group_size"], 128)
+                self.assertEqual(resolve_int4_config("org/Unknown", component="embeddings"),
+                                 {"bits": 8, "sym": True})
+
+    def test_flat_vlm_recipe_keeps_calibration_on_decoder_only(self):
+        decoder = resolve_int4_config("microsoft/Phi-4-mini-instruct", component="decoder")
+        self.assertTrue(decoder["quant_method"] == "awq")
+        for component in ("embeddings", "vision"):
+            recipe = resolve_int4_config("microsoft/Phi-4-mini-instruct", component=component)
+            self.assertEqual(recipe, {"bits": 8, "sym": True})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "recipes.json"
+            path.write_text(json.dumps({"models": {"org/VLM": {
+                "bits": 4, "dataset": "textvqa", "scale_estimation": True,
+            }}}), encoding="utf-8")
+            self.assertEqual(resolve_int4_config("org/VLM", path, component="decoder")["dataset"],
+                             "textvqa")
+            for component in ("embeddings", "vision"):
+                self.assertEqual(resolve_int4_config("org/VLM", path, component=component),
+                                 {"bits": 8, "sym": True})
+
+    def test_explicit_vlm_pipeline_overrides_and_exclusions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "recipes.json"
+            for default in (None, {"bits": 8, "sym": False}):
+                with self.subTest(default=default):
+                    path.write_text(json.dumps({"models": {"org/VLM": {
+                        "quantization_configs": {
+                            "lm_model": {"bits": 4},
+                            "text_embeddings_model": {"bits": 4, "group_size": 64},
+                            "vision_embeddings_model": None,
+                        }, "default_config": default,
+                    }}}), encoding="utf-8")
+                    embeddings = resolve_int4_config("org/VLM", path, component="embeddings")
+                    self.assertEqual((embeddings["bits"], embeddings["group_size"]), (4, 64))
+                    self.assertIsNone(resolve_int4_config("org/VLM", path, component="vision"))
+                    fallback = resolve_int4_config("org/VLM", path, component="other_model")
+                    if default is None:
+                        self.assertIsNone(fallback)
+                    else:
+                        self.assertEqual((fallback["bits"], fallback["sym"]), (8, False))
 
     def test_data_free_awq_does_not_use_export_example(self):
         recipe = resolve_int4_config("microsoft/Phi-4-mini-instruct")
@@ -325,6 +371,36 @@ class CompressionConfigTests(unittest.TestCase):
             })["logits"]
             self.assertEqual(logits.shape, (1, 3, 128))
             self.assertTrue(np.isfinite(logits).all())
+
+    def test_tokenizer_only_exports_genai_irs_without_loading_weights(self):
+        import openvino_genai as ov_genai
+
+        backend = Tokenizer(WordLevel({"[UNK]": 0, "Hello": 1, "world": 2}, unk_token="[UNK]"))
+        backend.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            weights = output_dir / "openvino_model.bin"
+            weights.write_bytes(b"existing model weights")
+            arguments = ["hf_export_int4.py", "--model-id", "local/tokenizer", "--output-dir", directory,
+                         "--tokenizer-only"]
+            with patch.object(sys, "argv", arguments), \
+                    patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer), \
+                    patch("transformers.AutoModelForCausalLM.from_pretrained") as load_model, \
+                    patch("int4_config.make_quantizer") as quantizer:
+                with self.assertRaises(SystemExit) as result:
+                    runpy.run_path(str(Path(__file__).with_name("hf_export_int4.py")), run_name="__main__")
+                self.assertEqual(result.exception.code, 0)
+                load_model.assert_not_called()
+                quantizer.assert_not_called()
+            self.assertEqual(weights.read_bytes(), b"existing model weights")
+            for name in ("openvino_tokenizer", "openvino_detokenizer"):
+                for suffix in (".xml", ".bin"):
+                    self.assertTrue((output_dir / (name + suffix)).is_file())
+            converted = ov_genai.Tokenizer(directory)
+            encoded = converted.encode("Hello world", add_special_tokens=False)
+            np.testing.assert_array_equal(encoded.input_ids.data, [[1, 2]])
+            self.assertEqual(converted.decode([1, 2]), "Hello world")
 
     def test_llama_genai_cache_batch_is_dynamic(self):
         import contextlib
@@ -746,6 +822,188 @@ fi
             self.assertEqual(row["throughput_tokens_per_s"], "N/A")
         for log in (summary.parent / "logs").glob("*.log"):
             self.assertIn("Mode: --no-chat-template", log.read_text(encoding="utf-8"))
+
+
+class PowerShellBenchmarkRunnerTests(unittest.TestCase):
+    def setUp(self):
+        self.powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if self.powershell is None:
+            self.skipTest("PowerShell is required")
+        temporary = tempfile.TemporaryDirectory(prefix="powershell-benchmark-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.models = self.root / "models.txt"
+        self.models.write_text('\ufeff # fixture\r\n org/Good, model # note\r\norg/Failure\norg/Missing',
+                               encoding="utf-8")
+        self.image = self.root / "image.jpg"
+        self.image.touch()
+        for name in ("Good, model", "Failure"):
+            for suffix in ("-int4-optimum", "-int4-hf-export", "-int4-hf-export-genai", "-hf-export"):
+                (self.root / (name + suffix)).mkdir()
+        self.fixture = self.root / "fake benchmark.py"
+        self.fixture.write_text('''import argparse
+import json
+import sys
+parser = argparse.ArgumentParser()
+parser.add_argument("-m")
+parser.add_argument("-M", type=int)
+args, extra = parser.parse_known_args()
+assert sys.stdin.read() == "", "stdin must be closed"
+print("stderr marker", file=sys.stderr)
+print("Arguments: " + json.dumps(extra))
+if args.m.endswith("Failure-int4-optimum"):
+    print("failure marker")
+    sys.exit(7)
+print("Prompt token size: 100")
+print("Output token size:", args.M)
+print("TTFT: 600.00 +/- 2.00 ms")
+if "Failure" in args.m:
+    sys.exit(0)
+print("Generate time: 3000.00 +/- 3.00 ms")
+if args.M == 1:
+    print("TPOT: N/A (fewer than two output tokens)")
+    print("Throughput : N/A (fewer than two output tokens)")
+else:
+    print("TPOT: 27.00 " + chr(177) + " 0.30 ms/token")
+    print("Throughput : 37.00 " + chr(177) + " 0.40 tokens/s")
+''', encoding="utf-8")
+
+    def run_batch(self, *extra):
+        script = Path(__file__).with_name("run_vlm_benchmarks.ps1")
+        counts = {"-NumWarmup": "0", "-NumIter": "2", "-MaxNewTokens": "4"}
+        counts.update(zip(extra[::2], extra[1::2]))
+        return subprocess.run([
+            self.powershell, "-NoProfile", "-File", str(script), "-ModelsFile", str(self.models),
+            "-ModelRoot", str(self.root), "-OutputDir", str(self.root / "results directory"),
+            "-Python", sys.executable, "-HfScript", str(self.fixture), "-GenaiScript", str(self.fixture),
+            "-Image", str(self.image), "-Profile", "-Prompt", 'caption, with "quotes" and trailing slash\\',
+            *[value for pair in counts.items() for value in pair],
+        ], capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+
+    def test_batch_logs_and_continues_after_failures(self):
+        result = self.run_batch()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        summary = self.root / "results directory" / "summary.csv"
+        with summary.open(newline="", encoding="utf-8-sig") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual([row["status"] for row in rows],
+                         ["ok", "ok", "failed", "missing_metrics", "missing_model", "missing_model"])
+        self.assertEqual(rows[0]["model_id"], "org/Good, model")
+        self.assertEqual(rows[2]["exit_code"], "7")
+        for row in rows[:2]:
+            self.assertEqual(row["input_tokens"], "100")
+            self.assertEqual(row["ttft_ms"], "600.00")
+            self.assertEqual(row["ttft_std_ms"], "2.00")
+            self.assertEqual(row["tpot_std_ms"], "0.30")
+            self.assertEqual(row["throughput_tokens_per_s"], "37.00")
+            self.assertEqual(row["throughput_std_tokens_per_s"], "0.40")
+            log = Path(row["log_file"]).read_text(encoding="utf-8")
+            self.assertIn("stderr marker", log)
+            arguments = json.loads(next(line.removeprefix("Arguments: ") for line in log.splitlines()
+                                        if line.startswith("Arguments: ")))
+            self.assertEqual(arguments[arguments.index("-p") + 1], 'caption, with "quotes" and trailing slash\\')
+            self.assertEqual("--profile" in arguments, row["backend"] == "hf_exporters")
+        saved = summary.read_bytes()
+        self.assertEqual(self.run_batch().returncode, 2)
+        self.assertEqual(summary.read_bytes(), saved)
+
+    def test_one_token_and_invalid_count(self):
+        self.models.write_text("org/Good, model\n", encoding="utf-8")
+        result = self.run_batch("-NumIter", "0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "results directory").exists())
+        result = self.run_batch("-MaxNewTokens", "1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with (self.root / "results directory" / "summary.csv").open(newline="", encoding="utf-8-sig") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["tpot_ms"], "N/A")
+            self.assertEqual(row["tpot_std_ms"], "")
+            self.assertEqual(row["throughput_tokens_per_s"], "N/A")
+
+
+class PowerShellLLMBenchmarkRunnerTests(PowerShellBenchmarkRunnerTests):
+    def run_batch(self, *extra):
+        script = Path(__file__).with_name("run_llm_benchmarks.ps1")
+        parameters = {
+            "-ModelsFile": str(self.models), "-ModelRoot": str(self.root),
+            "-OutputDir": str(self.root / "results directory"), "-Python": sys.executable,
+            "-HfScript": str(self.fixture), "-GenaiScript": str(self.fixture),
+            "-Prompt": 'explain, with "quotes" and trailing slash\\',
+            "-NumWarmup": "0", "-NumIter": "2", "-MaxNewTokens": "4",
+        }
+        parameters.update(zip(extra[::2], extra[1::2]))
+        arguments = []
+        for key, value in parameters.items():
+            arguments.append(key)
+            if value is not None:
+                arguments.append(value)
+        return subprocess.run([
+            self.powershell, "-NoProfile", "-File", str(script), *arguments,
+        ], capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+
+    def test_batch_logs_and_continues_after_failures(self):
+        result = self.run_batch()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        summary = self.root / "results directory" / "summary.csv"
+        with summary.open(newline="", encoding="utf-8-sig") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual([row["status"] for row in rows],
+                         ["ok", "ok", "ok", "failed", "missing_metrics", "missing_metrics",
+                          "missing_model", "missing_model", "missing_model"])
+        self.assertEqual([row["backend"] for row in rows[:3]],
+                         ["optimum", "hf-exporters-genai", "hf-exporters"])
+        self.assertEqual(rows[3]["exit_code"], "7")
+        for row, suffix in zip(rows[:3], ("-int4-optimum", "-int4-hf-export-genai", "-hf-export")):
+            self.assertTrue(row["model_dir"].endswith("Good, model" + suffix))
+            self.assertEqual(row["input_tokens"], "100")
+            self.assertEqual(row["throughput_tokens_per_s"], "37.00")
+            log = Path(row["log_file"]).read_text(encoding="utf-8")
+            arguments = json.loads(next(line.removeprefix("Arguments: ") for line in log.splitlines()
+                                        if line.startswith("Arguments: ")))
+            self.assertIn("--disable-thinking", arguments)
+            self.assertNotIn("-i", arguments)
+            self.assertNotIn("--profile", arguments)
+            self.assertEqual(arguments[arguments.index("-p") + 1], 'explain, with "quotes" and trailing slash\\')
+        saved = summary.read_bytes()
+        self.assertEqual(self.run_batch().returncode, 2)
+        self.assertEqual(summary.read_bytes(), saved)
+
+    def test_one_token_and_invalid_count(self):
+        self.models.write_text("org/Good, model\n", encoding="utf-8")
+        self.assertNotEqual(self.run_batch("-NumIter", "0").returncode, 0)
+        self.assertFalse((self.root / "results directory").exists())
+        result = self.run_batch("-MaxNewTokens", "1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with (self.root / "results directory" / "summary.csv").open(newline="", encoding="utf-8-sig") as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertEqual(row["tpot_ms"], "N/A")
+            self.assertEqual(row["throughput_tokens_per_s"], "N/A")
+
+    def test_suffix_and_thinking_overrides(self):
+        self.models.write_text("org/Good, model\n", encoding="utf-8")
+        result = self.run_batch("-OptimumSuffix", "-hf-export", "-HfGenaiSuffix", "-hf-export",
+                                "-HfSuffix", "-int4-optimum", "-EnableThinking", "-NoChatTemplate")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse((self.root / "results directory").exists())
+        for mode, flag in (("-EnableThinking", "--enable-thinking"), ("-NoChatTemplate", "--no-chat-template")):
+            with self.subTest(mode=mode):
+                result = self.run_batch("-OutputDir", str(self.root / mode[1:]),
+                                        "-OptimumSuffix", "-hf-export", "-HfGenaiSuffix", "-hf-export",
+                                        "-HfSuffix", "-int4-optimum", mode, None)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                with (self.root / mode[1:] / "summary.csv").open(newline="", encoding="utf-8-sig") as source:
+                    rows = list(csv.DictReader(source))
+                for row in rows:
+                    log = Path(row["log_file"]).read_text(encoding="utf-8")
+                    arguments = json.loads(next(line.removeprefix("Arguments: ") for line in log.splitlines()
+                                                if line.startswith("Arguments: ")))
+                    self.assertIn(flag, arguments)
+                self.assertTrue(rows[0]["model_dir"].endswith("Good, model-hf-export"))
+                self.assertTrue(rows[2]["model_dir"].endswith("Good, model-int4-optimum"))
 
 
 class BenchmarkTokenSelectionTests(unittest.TestCase):

@@ -18,6 +18,15 @@ from int4_config import (
     prepare_text_calibration, resolve_int4_config,
 )
 
+
+def export_tokenizer(tokenizer, output_dir):
+    tokenizer.save_pretrained(output_dir)
+    ov_tokenizer, ov_detokenizer = convert_tokenizer(tokenizer, with_detokenizer=True)
+    ov.save_model(ov_tokenizer, output_dir / "openvino_tokenizer.xml")
+    ov.save_model(ov_detokenizer, output_dir / "openvino_detokenizer.xml")
+    print(f"Saved GenAI tokenizer and detokenizer to {output_dir}", flush=True)
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
 parser.add_argument("--group-size", type=int, choices=[-1, 32, 64, 128])
@@ -27,7 +36,13 @@ parser.add_argument("--calibration-data", type=Path, help="Directory of preproce
 parser.add_argument("--calibration-num-samples", type=int, help="Override the recipe's calibration sample count (default: 128)")
 parser.add_argument("--calibration-seed", type=int, default=42)
 parser.add_argument("--output-dir", type=Path, default=Path("hf_exporters_model_int4"))
+parser.add_argument("--tokenizer-only", action="store_true",
+                    help="Convert and save GenAI tokenizer IRs without loading or exporting model weights")
 args = parser.parse_args()
+if args.tokenizer_only:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    export_tokenizer(AutoTokenizer.from_pretrained(args.model_id), args.output_dir)
+    raise SystemExit(0)
 if args.ratio is not None and not 0 <= args.ratio <= 1:
     parser.error("--ratio must be between 0 and 1")
 if args.calibration_num_samples is not None and args.calibration_num_samples < 1:
@@ -100,8 +115,4 @@ ov.save_model(ov_model, output_dir / "openvino_model.xml")
 )
 model.config.save_pretrained(output_dir)
 model.generation_config.save_pretrained(output_dir)
-tokenizer.save_pretrained(output_dir)
-
-ov_tokenizer, ov_detokenizer = convert_tokenizer(tokenizer, with_detokenizer=True)
-ov.save_model(ov_tokenizer, output_dir / "openvino_tokenizer.xml")
-ov.save_model(ov_detokenizer, output_dir / "openvino_detokenizer.xml")
+export_tokenizer(tokenizer, output_dir)

@@ -53,11 +53,13 @@ def resolve_int4_config(model_id, config_path=None, *, component=None, group_siz
             raise ValueError(f"Ambiguous INT4 model basename: {model_id}; use the full model ID")
         recipe = matches[0] if matches else None
     matched = recipe is not None
+    pipeline_config = False
     if matched:
         recipe = copy.deepcopy(recipe)
         if not isinstance(recipe, dict):
             raise ValueError(f"INT4 recipe for {model_id} must be an object")
         if "quantization_configs" in recipe:
+            pipeline_config = True
             name = COMPONENT_NAMES.get(component, component or "lm_model")
             recipe = recipe["quantization_configs"].get(name, recipe.get("default_config"))
             if recipe is None:
@@ -65,8 +67,8 @@ def resolve_int4_config(model_id, config_path=None, *, component=None, group_siz
         result = {"bits": 4, "sym": False, "ratio": 1.0, **recipe}
     else:
         result = {**FALLBACK_CONFIG, **document.get("defaults", {})}
-        if component == "embeddings":
-            return None
+    if not pipeline_config and component in ("embeddings", "vision"):
+        result = {"bits": 8, "sym": True}
     if group_size is not None and result.get("bits") == 4:
         result["group_size"] = group_size
     if ratio is not None and result.get("bits") == 4:
