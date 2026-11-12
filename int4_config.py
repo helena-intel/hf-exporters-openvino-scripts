@@ -77,6 +77,17 @@ def resolve_int4_config(model_id, config_path=None, *, component=None, group_siz
     return result
 
 
+def data_free_config(recipe):
+    if recipe is None:
+        return None
+    result = copy.deepcopy(recipe)
+    for name in ("dataset", "num_samples", "scale_estimation", "gptq", "lora_correction"):
+        result.pop(name, None)
+    if result.get("sensitivity_metric") not in (None, "weight_quantization_error"):
+        result["sensitivity_metric"] = "weight_quantization_error"
+    return result
+
+
 def validate_config(recipe):
     supported = {
         "bits", "sym", "group_size", "ratio", "all_layers", "sensitivity_metric",

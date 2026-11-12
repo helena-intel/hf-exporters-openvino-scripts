@@ -1,5 +1,4 @@
 import argparse
-from contextlib import ExitStack
 import json
 
 from transformers.exporters import (
@@ -14,8 +13,7 @@ from transformers.exporters.decompose import decompose_for_generation
 from transformers.exporters.utils import get_leaf_tensors
 from openvino_tokenizers import convert_tokenizer
 from int4_config import (
-    TEXT_CALIBRATION_DATASETS, apply_runtime_config, make_quantizer,
-    prepare_text_calibration, resolve_int4_config,
+    apply_runtime_config, data_free_config, make_quantizer, resolve_int4_config,
 )
 
 
@@ -32,9 +30,6 @@ parser.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
 parser.add_argument("--group-size", type=int, choices=[-1, 32, 64, 128])
 parser.add_argument("--ratio", type=float)
 parser.add_argument("--int4-config", type=Path, help="Override the local per-model INT4 recipes")
-parser.add_argument("--calibration-data", type=Path, help="Directory of preprocessed OpenVINO input .npz files")
-parser.add_argument("--calibration-num-samples", type=int, help="Override the recipe's calibration sample count (default: 128)")
-parser.add_argument("--calibration-seed", type=int, default=42)
 parser.add_argument("--output-dir", type=Path, default=Path("hf_exporters_model_int4"))
 parser.add_argument("--tokenizer-only", action="store_true",
                     help="Convert and save GenAI tokenizer IRs without loading or exporting model weights")
@@ -45,16 +40,11 @@ if args.tokenizer_only:
     raise SystemExit(0)
 if args.ratio is not None and not 0 <= args.ratio <= 1:
     parser.error("--ratio must be between 0 and 1")
-if args.calibration_num_samples is not None and args.calibration_num_samples < 1:
-    parser.error("--calibration-num-samples must be positive")
 try:
-    compression = resolve_int4_config(
+    compression = data_free_config(resolve_int4_config(
         args.model_id, args.int4_config, group_size=args.group_size, ratio=args.ratio,
-    )
-    if args.calibration_num_samples is not None:
-        compression["num_samples"] = args.calibration_num_samples
-    automatic_calibration = args.calibration_data is None and compression.get("dataset") in TEXT_CALIBRATION_DATASETS
-    quantizer = None if automatic_calibration else make_quantizer(compression, args.calibration_data)
+    ))
+    quantizer = make_quantizer(compression)
 except (ValueError, OSError) as error:
     parser.error(str(error))
 print("Compression recipe: " + json.dumps(compression), flush=True)
@@ -93,14 +83,7 @@ dynamic_shapes["past_key_values"] = [
 openvino_int4 = OpenVINOConfig(
     dynamic_shapes=dynamic_shapes, stateful=True, quantizer=quantizer
 )
-with ExitStack() as stack:
-    if automatic_calibration:
-        providers = stack.enter_context(prepare_text_calibration(
-            model, tokenizer, compression, exporter=exporter, export_configs={"model": openvino_int4},
-            seed=args.calibration_seed, preserve_attention_mask=True,
-        ))
-        openvino_int4.quantizer = make_quantizer(compression, calibration_samples=providers["model"])
-    ov_model = exporter.export(decode_model, decode_inputs, openvino_int4).program
+ov_model = exporter.export(decode_model, decode_inputs, openvino_int4).program
 
 preprocessor = ov.preprocess.PrePostProcessor(ov_model)
 preprocessor.output("logits").tensor().set_element_type(ov.Type.f32)

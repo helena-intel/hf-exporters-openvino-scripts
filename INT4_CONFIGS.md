@@ -48,8 +48,8 @@ at a time because its linear-attention kernels differ between prefill and decode
 Model recognition does not guarantee upstream export/runtime support: Gemma4 and
 Qwen3.5 full-checkpoint validation remains necessary.
 
-Calibration follows the INT4 recipe's dataset by default or uses the existing `.npz` contract
-below. No export example prompt/image is silently substituted for required data.
+All export scripts now use data-free weight compression. AWQ is retained only
+when requested by the original recipe; no calibration datasets are loaded.
 
 ## Native VLM Benchmark
 
@@ -172,62 +172,30 @@ present, that component is not compressed. Snapshot audio entries are unused by
 the image-text-to-text exporter. Unsupported sequential/specialized recipes fail
 explicitly rather than approximating their settings.
 
-## Calibration
+## Data-Free Compression
 
-Dataset-free AWQ, including Phi-4-mini's default, uses NNCF's data-free algorithm.
-HF still converts the model; the quantizer does not substitute the export sample
-as calibration data.
+Both LLM and VLM export scripts remove the original recipe's `dataset`,
+`num_samples`, `scale_estimation`, `gptq`, and `lora_correction` settings.
+Activation-dependent sensitivity metrics become `weight_quantization_error`.
+AWQ remains enabled only when the recipe requests `quant_method: "awq"` or
+`awq: true`, and uses NNCF's data-free algorithm. No calibration data is passed
+to NNCF, downloaded, or captured from the export example. Calibration CLI
+options have been removed.
 
-Some defaults require real calibration data. For example, Gemma 4 E2B/E4B specify
-TextVQA, AWQ, and scale estimation for the decoder, with INT8 symmetric compression
-for vision and embeddings. The unified exporter automatically prepares TextVQA
-when the component recipe specifies it, unless `--calibration-data` supplies feeds.
-Data-free recipes remain data-free. Unsupported named datasets require manual feeds.
+The original recipe snapshot is unchanged; export scripts save the effective
+data-free recipe. `--image` is still required for VLM tracing, not calibration.
+This intentionally differs from Optimum's calibration-backed recipes and can
+change compressed weights and accuracy. See [README.md](README.md) for known
+architecture, runtime, and benchmark limitations.
 
-The unified native exporter can prepare calibration directly from HF Datasets:
+Use the unified exporter for architectures supported by Transformers, including
+Gemma 3. The older `hf_export_multimodels_int4.py` custom component exporter
+still supports only Gemma 4 and Qwen3.5:
 
 ```bash
-python hf_export_models_int4.py --model-id google/gemma-4-E4B-it --image dog.jpg
-python hf_export_models_int4.py --models-file models.txt --image dog.jpg --calibration-num-samples 32 --calibration-seed 42
+python hf_export_models_int4.py --model-id google/gemma-3-12b-it --image dog.jpg
+python hf_export_models_int4.py --models-file models.txt --image dog.jpg
 ```
-
-This requires `datasets` and Pillow in the export environment (`python -m pip
-install datasets pillow`). TextVQA uses `lmms-lab/textvqa`, validation split,
-streaming and seeded shuffle, as in Optimum. Downloads use the usual Hugging Face
-cache and authentication settings. Other named datasets are not yet supported.
-Text-only models in mixed batches skip TextVQA and keep their normal recipes.
-
-Each real image/question is processed with the model's chat template and processor,
-then passed through native generation calibration capture. The resulting component
-feeds include multimodal embeddings, positions and explicit cache inputs before
-OpenVINO state folding. INT8 weight compression remains data-free. Feeds are
-spooled to temporary disk storage and replayed for NNCF rather than retaining all
-calibration caches in RAM; allow sufficient space in the system temporary directory.
-Streaming iterators and temporary storage are closed on success or failure.
-
-`--calibration-num-samples` limits image/question rows, defaulting to the component
-recipe's `num_samples` or 32, matching Optimum's visual-language calibration path
-(its general weight-compression fallback is 128). An explicit CLI count overrides
-the recipe. Effective recipes and the shuffle seed are saved in
-`compression_config.json`. Multi-token decoder graphs use one prefill feed per
-image, matching Optimum's prompt-based collection; single-token-only graphs use
-one decode feed per image instead. NNCF's `subset_size` uses the same sample limit,
-so 32 items yield 32 decoder feeds, rather than a mix of 16 decode/prefill pairs.
-This is not a promise of bit-identical Optimum calibration.
-`--image` is still required for tracing and does not become a calibration sample.
-
-`--calibration-data` accepts a directory of `.npz` files. Each file must contain
-representative, preprocessed inputs for the graph being compressed, with array keys
-matching its OpenVINO input names, including any explicit cache inputs. Loading uses
-`allow_pickle=False`. The text exporter reads files directly in that directory;
-the multimodal exporter reads `decoder/`, `vision/`, and `embeddings/` subdirectories
-for components requiring data. INT8 weight compression is data-free.
-This option is mutually exclusive with `--calibration-dataset`. Use graph input
-names from native exports; older custom-export feeds may be incompatible.
-
-Alternatively, edit the local recipe to remove `dataset` and disable
-`scale_estimation` / `gptq` if data-free compression is intentional. That is a
-different recipe from Optimum's calibration-backed default, not an equivalent export.
 
 The legacy text exporter saves `compression_config.json`; the legacy multimodal
 exporter records each effective recipe in `export_manifest.json`. The unified native

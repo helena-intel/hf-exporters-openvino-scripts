@@ -88,10 +88,38 @@ class CachedDecoderTests(unittest.TestCase):
 
 
 class MediaTests(unittest.TestCase):
+    def test_int8_embedding_export_returns_openvino_model(self):
+        class Embeddings(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = torch.nn.Embedding(128, 32)
+
+            def forward(self, input_ids):
+                return {"inputs_embeds": self.embedding(input_ids)}
+
+        torch.manual_seed(7)
+        model = Embeddings().eval()
+        inputs = {"input_ids": torch.tensor([[2, 3, 4]], dtype=torch.long)}
+        with torch.no_grad():
+            expected = model(**inputs)["inputs_embeds"].numpy()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "embeddings.xml"
+            graph = export_component(
+                model, inputs, path, {"input_ids": {0: torch.export.Dim.AUTO, 1: torch.export.Dim.AUTO}},
+                compression_config={"bits": 8, "sym": True},
+            )
+            self.assertIsInstance(graph, ov.Model)
+            restored = ov.Core().read_model(path)
+            self.assertTrue(any(node.get_output_element_type(0) == ov.Type.i8
+                                for node in restored.get_ops() if node.get_type_name() == "Constant"))
+            compiled = ov.Core().compile_model(restored, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
+            actual = compiled({compiled.inputs[0].get_any_name(): inputs["input_ids"].numpy()})[0]
+            np.testing.assert_allclose(actual, expected, atol=.04, rtol=.02)
+
     def check_component(self, component, inputs):
         from transformers.exporters.utils import precompute_export_inputs
 
-        precompute_export_inputs(component, inputs)
+        inputs = precompute_export_inputs(component.config, inputs)
         with torch.no_grad():
             expected = component(**inputs)
         with tempfile.TemporaryDirectory() as directory:
@@ -182,11 +210,17 @@ class MediaTests(unittest.TestCase):
                 graph = ov.Core().read_model(output / manifest["components"][name]["file"])
                 ov.Core().compile_model(graph, "CPU")
 
-    def test_calibration_requirement_is_checked_before_model_loading(self):
-        with patch("transformers.AutoConfig.from_pretrained") as load:
-            with self.assertRaisesRegex(ValueError, "representative calibration"):
+    def test_original_calibration_recipe_is_normalized_before_export(self):
+        with patch("transformers.AutoConfig.from_pretrained", return_value=Mock(model_type="unsupported")), \
+                patch("int4_config.make_quantizer") as quantizer:
+            with self.assertRaisesRegex(ValueError, "Unsupported model type"):
                 export_model("google/gemma-4-E2B-it", Path("unused"), Path("missing.png"))
-        load.assert_not_called()
+        self.assertEqual(quantizer.call_count, 3)
+        for call in quantizer.call_args_list:
+            self.assertEqual(len(call.args), 1)
+            for name in ("dataset", "num_samples", "scale_estimation", "gptq", "lora_correction"):
+                self.assertNotIn(name, call.args[0])
+        self.assertEqual(quantizer.call_args_list[0].args[0]["quant_method"], "awq")
 
     def check_export_and_inference(self, model, processed):
         import json
@@ -444,7 +478,7 @@ class CommandLineTests(unittest.TestCase):
                     "--output-dir", directory,
                 ]), 0)
             export.assert_called_once_with("org/Model", Path(directory), image,
-                                           group_size=None, ratio=None, int4_config=None, calibration_data=None)
+                                           group_size=None, ratio=None, int4_config=None)
 
     def test_invalid_export_plans(self):
         for options in (

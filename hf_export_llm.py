@@ -1,7 +1,6 @@
 """Export an INT4 LLM with native HF OpenVINO exporters and run greedy inference."""
 
 import argparse
-from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -9,8 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.exporters import ExportedModel, OpenVINOConfig, OpenVINOExporter
 
 from int4_config import (
-    TEXT_CALIBRATION_DATASETS, apply_runtime_config, make_quantizer,
-    prepare_text_calibration, resolve_int4_config,
+    apply_runtime_config, data_free_config, make_quantizer, resolve_int4_config,
 )
 
 
@@ -20,22 +18,14 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path("hf_exporters_llm_int4"))
     parser.add_argument("--prompt", default="What is OpenVINO?")
     parser.add_argument("--max-new-tokens", type=int, default=100)
-    parser.add_argument("--calibration-data", type=Path, help="Preprocessed .npz inputs for recipes requiring calibration")
-    parser.add_argument("--calibration-num-samples", type=int, help="Override the recipe's calibration sample count (default: 128)")
     args = parser.parse_args()
     if not args.prompt.strip() or args.max_new_tokens < 1:
         parser.error("The prompt must not be empty and --max-new-tokens must be positive")
-    if args.calibration_num_samples is not None and args.calibration_num_samples < 1:
-        parser.error("--calibration-num-samples must be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("--output-dir must be empty to avoid mixing incompatible exports")
     try:
-        recipe = resolve_int4_config(args.model_id)
-        if args.calibration_num_samples is not None:
-            recipe["num_samples"] = args.calibration_num_samples
-        # Explicit .npz inputs override automatic sampling from the recipe's dataset.
-        automatic_calibration = args.calibration_data is None and recipe.get("dataset") in TEXT_CALIBRATION_DATASETS
-        quantizer = None if automatic_calibration else make_quantizer(recipe, args.calibration_data)
+        recipe = data_free_config(resolve_int4_config(args.model_id))
+        quantizer = make_quantizer(recipe)
     except (ValueError, OSError) as error:
         parser.error(str(error))
 
@@ -53,14 +43,7 @@ def main():
     exporter = OpenVINOExporter()
     # Allow varying input shapes and keep the KV cache in OpenVINO state variables.
     configs = {"model": OpenVINOConfig(dynamic=True, stateful=True, quantizer=quantizer)}
-    with ExitStack() as stack, torch.no_grad():
-        if automatic_calibration:
-            # Capture real decoder feeds, not just token IDs. ExitStack keeps their
-            # temporary files alive until quantization finishes during export.
-            providers = stack.enter_context(prepare_text_calibration(
-                model, tokenizer, recipe, exporter=exporter, export_configs=configs,
-            ))
-            configs["model"].quantizer = make_quantizer(recipe, calibration_samples=providers["model"])
+    with torch.no_grad():
         artifacts = exporter.export_for_generation(model, inputs, configs)
     # Store optional dq_group_size as DYNAMIC_QUANTIZATION_GROUP_SIZE metadata
     # for activation quantization at inference, separate from INT4 weight compression.

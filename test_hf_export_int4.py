@@ -20,6 +20,25 @@ from int4_config import DEFAULT_CONFIG_PATH, make_compression_config, make_quant
 
 
 class CompressionConfigTests(unittest.TestCase):
+    def test_data_free_recipe_preserves_awq_without_calibration_settings(self):
+        from int4_config import data_free_config
+
+        for awq in ({"quant_method": "awq"}, {"awq": True}, {}):
+            with self.subTest(awq=awq):
+                original = {"bits": 4, "group_size": 32, "dataset": "textvqa", "num_samples": 3,
+                            "scale_estimation": True, "gptq": True, "lora_correction": True,
+                            "sensitivity_metric": "mean_activation_magnitude", **awq}
+                recipe = data_free_config(original)
+                self.assertEqual(recipe, {"bits": 4, "group_size": 32,
+                                          "sensitivity_metric": "weight_quantization_error", **awq})
+                self.assertEqual(original["dataset"], "textvqa")
+                with patch("nncf.compress_weights", return_value="compressed") as compress:
+                    make_quantizer(recipe).quantize("graph", {"dummy": "input"}, None)
+                self.assertIsNone(compress.call_args.kwargs["dataset"])
+                self.assertEqual(compress.call_args.kwargs["awq"], bool(awq))
+        self.assertIsNone(data_free_config(None))
+        self.assertEqual(data_free_config({"bits": 8, "sym": True}), {"bits": 8, "sym": True})
+
     def test_upstream_phi_and_symmetric_defaults(self):
         self.assertEqual(len(json.loads(DEFAULT_CONFIG_PATH.read_text())["models"]), 78)
         recipe = resolve_int4_config("microsoft/Phi-4-mini-instruct")
@@ -321,7 +340,7 @@ class CompressionConfigTests(unittest.TestCase):
                                 np.testing.assert_array_equal(feeds[0]["attention_mask"], expected.numpy())
                     self.assertIs(captured["attention_mask"], captured_mask)
 
-    def test_qwen3_genai_export_with_text_calibration(self):
+    def test_qwen3_genai_export_uses_data_free_awq(self):
         from transformers import Qwen3Config, Qwen3ForCausalLM
 
         config = Qwen3Config(
@@ -343,18 +362,21 @@ class CompressionConfigTests(unittest.TestCase):
         recipe = {"bits": 4, "sym": False, "group_size": 32, "ratio": 1.0,
                   "dataset": "wikitext2", "num_samples": 2, "awq": True}
 
-        def samples(*args):
-            for text in ("Hello world!", "Hello world! Hello world!"):
-                yield dict(tokenizer(text, return_tensors="pt"))
-
         with tempfile.TemporaryDirectory() as directory:
             arguments = ["hf_export_int4.py", "--model-id", "local/tiny-qwen3", "--output-dir", directory]
-            with patch.object(sys, "argv", arguments), \
-                    patch("transformers.AutoModelForCausalLM.from_pretrained", return_value=model), \
-                    patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer), \
-                    patch("int4_config.resolve_int4_config", return_value=recipe), \
-                    patch("int4_config.text_calibration_samples", side_effect=samples):
+            with (
+                patch.object(sys, "argv", arguments),
+                patch("transformers.AutoModelForCausalLM.from_pretrained", return_value=model),
+                patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer),
+                patch("int4_config.resolve_int4_config", return_value=recipe),
+                patch("int4_config.text_calibration_samples") as samples,
+            ):
                 runpy.run_path(str(Path(__file__).with_name("hf_export_int4.py")), run_name="__main__")
+            samples.assert_not_called()
+            saved_recipe = json.loads((Path(directory) / "compression_config.json").read_text())
+            self.assertTrue(saved_recipe["awq"])
+            self.assertNotIn("dataset", saved_recipe)
+            self.assertNotIn("num_samples", saved_recipe)
             graph = ov.Core().read_model(Path(directory) / "openvino_model.xml")
             self.assertTrue(graph.get_variables())
             self.assertEqual(graph.input("attention_mask").get_partial_shape().rank.get_length(), 2)
@@ -500,9 +522,7 @@ class CompressionConfigTests(unittest.TestCase):
             models = Path(directory) / "models.txt"
             models.write_text("microsoft/Phi-4-mini-instruct\n")
             for overrides in ([], ["--group-size", "32", "--ratio", "0.8",
-                                "--int4-config", "custom.json", "--calibration-data", "calibration"],
-                            ["--calibration-dataset", "textvqa", "--calibration-num-samples", "2",
-                             "--calibration-seed", "17"]):
+                                  "--int4-config", "custom.json"]):
                 arguments = ["hf_export_models_int4.py", "--models-file", str(models), *overrides]
                 with patch.object(sys, "argv", arguments), \
                         patch("subprocess.run", return_value=Mock(returncode=0)) as run, \
@@ -1225,7 +1245,7 @@ class UnifiedExportTests(unittest.TestCase):
             inference_result = generate_native(compressed_output, image, "Describe this image.", max_new_tokens=3)
             self.assertEqual(inference_result["token_ids"], actual[0, inputs.input_ids.shape[1]:].tolist())
 
-    def test_native_vlm_default_textvqa_calibration_export_and_generate(self):
+    def test_native_vlm_uses_data_free_awq_and_generates(self):
         from PIL import Image
         from transformers import CLIPImageProcessor, CLIPVisionConfig, LlavaConfig, LlavaForConditionalGeneration, LlavaProcessor
         from transformers.exporters import ExportArtifacts
@@ -1246,19 +1266,6 @@ class UnifiedExportTests(unittest.TestCase):
             patch_size=4, num_additional_image_tokens=1, vision_feature_select_strategy="default",
             chat_template="{{ '<image> ' + messages[0]['content'][1]['text'] }}",
         )
-        events = []
-
-        def samples(processor_arg, count, seed):
-            self.assertIs(processor_arg, processor)
-            self.assertEqual((count, seed), (2, 17))
-            try:
-                for color in ("blue", "green"):
-                    events.append(color)
-                    yield dict(processor(text="<image> Hello Hello", images=Image.new("RGB", (8, 8), color),
-                                         return_tensors="pt"))
-            finally:
-                events.append("closed")
-
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             image = root / "image.png"
@@ -1272,13 +1279,15 @@ class UnifiedExportTests(unittest.TestCase):
             with patch("transformers.AutoConfig.from_pretrained", return_value=config), \
                     patch("transformers.AutoModelForImageTextToText.from_pretrained", return_value=model), \
                     patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
-                    patch("int4_config.textvqa_samples", side_effect=samples):
-                export_model("local/tiny-llava", output, image=image, int4_config=recipes,
-                             calibration_seed=17)
-            self.assertEqual(events, ["blue", "green", "closed"])
+                    patch("int4_config.prepare_textvqa_calibration") as calibration:
+                export_model("local/tiny-llava", output, image=image, int4_config=recipes)
+            calibration.assert_not_called()
             metadata = json.loads((output / "compression_config.json").read_text())
-            self.assertEqual(metadata["calibration"], {"dataset": "textvqa", "seed": 17})
-            self.assertEqual(metadata["components"]["language_model"]["num_samples"], 2)
+            self.assertIsNone(metadata["calibration"])
+            decoder_recipe = metadata["components"]["language_model"]
+            self.assertEqual(decoder_recipe["quant_method"], "awq")
+            for name in ("dataset", "num_samples", "scale_estimation"):
+                self.assertNotIn(name, decoder_recipe)
             artifacts = ExportArtifacts.from_pretrained(output)
             graph = artifacts["language_model"].program
             self.assertTrue(graph.get_variables())
@@ -1347,7 +1356,7 @@ class UnifiedExportTests(unittest.TestCase):
         torch.testing.assert_close(first, repeated)
         self.assertGreater(first.shape[1], inputs["input_ids"].shape[1])
 
-    def test_missing_image_or_unsupported_dataset_fails_before_weight_loading(self):
+    def test_missing_image_fails_before_weight_loading(self):
         from transformers import Gemma4Config
         from hf_export_models_int4 import export_model
 
@@ -1356,9 +1365,6 @@ class UnifiedExportTests(unittest.TestCase):
                 patch("transformers.AutoModelForImageTextToText.from_pretrained") as load:
             with self.assertRaisesRegex(ValueError, "requires --image"):
                 export_model("google/gemma-4-E2B-it", Path(directory) / "export")
-            with patch("int4_config.resolve_int4_config", return_value={"bits": 4, "dataset": "unsupported"}):
-                with self.assertRaisesRegex(ValueError, "Automatic calibration.*not supported"):
-                    export_model("google/gemma-4-E2B-it", Path(directory) / "export", image="example.png")
             load.assert_not_called()
 
     def test_batch_forwards_image_and_preserves_failures(self):

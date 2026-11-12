@@ -148,22 +148,23 @@ def cached_decoder(model, family):
 
 def export_component(model, inputs, path, dynamic_shapes, *, group_size=128,
                      ratio=1.0, stateful=False, quantize=True, sliding_window=None,
-                     layer_types=(), compression_config=None, calibration_data=None):
+                     layer_types=(), compression_config=None):
     import openvino as ov
     from transformers.exporters import (
         OpenVINOConfig,
         OpenVINOExporter,
     )
-    from int4_config import FALLBACK_CONFIG, apply_runtime_config, make_quantizer
+    from int4_config import FALLBACK_CONFIG, apply_runtime_config, data_free_config, make_quantizer
 
     quantizer = None
     if quantize:
         compression_config = compression_config or {**FALLBACK_CONFIG, "group_size": group_size, "ratio": ratio}
-        quantizer = make_quantizer(compression_config, calibration_data)
+        compression_config = data_free_config(compression_config)
+        quantizer = make_quantizer(compression_config)
     config = OpenVINOConfig(
         dynamic_shapes=dynamic_shapes, stateful=stateful, quantizer=quantizer,
     )
-    graph = OpenVINOExporter().export(model, inputs, config)
+    graph = OpenVINOExporter().export(model, inputs, config).program
     if stateful and not graph.get_variables():
         raise RuntimeError("HF export did not produce decoder cache state variables")
     if sliding_window is not None:
@@ -254,7 +255,7 @@ def model_adapters(model):
 
 
 def export_model(model_id, output_dir, image_path, *, group_size=None, ratio=None,
-                 int4_config=None, calibration_data=None):
+                 int4_config=None):
     import importlib.metadata
     import json
 
@@ -262,18 +263,16 @@ def export_model(model_id, output_dir, image_path, *, group_size=None, ratio=Non
     import torch
     from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
     from transformers.exporters.utils import get_leaf_tensors, precompute_export_inputs
-    from int4_config import make_quantizer, resolve_int4_config
+    from int4_config import make_quantizer, data_free_config, resolve_int4_config
 
     recipes = {
-        name: resolve_int4_config(model_id, int4_config, component=name, group_size=group_size, ratio=ratio)
+        name: data_free_config(resolve_int4_config(
+            model_id, int4_config, component=name, group_size=group_size, ratio=ratio,
+        ))
         for name in ("decoder", "vision", "embeddings")
     }
-    calibration_paths = {
-        name: Path(calibration_data) / name if calibration_data is not None else None
-        for name in recipes
-    }
     for name, recipe in recipes.items():
-        make_quantizer(recipe, calibration_paths[name])
+        make_quantizer(recipe)
     print("Compression recipes: " + json.dumps(recipes), flush=True)
 
     config = AutoConfig.from_pretrained(model_id)
@@ -320,7 +319,7 @@ def export_model(model_id, output_dir, image_path, *, group_size=None, ratio=Non
         print(f"Exporting {model_id}: {name} -> {output_dir / filename}", flush=True)
         graph = export_component(
             component, inputs, output_dir / filename, shapes,
-            compression_config=recipes[name], calibration_data=calibration_paths[name],
+            compression_config=recipes[name],
             quantize=recipes[name] is not None, **options,
         )
         manifest["components"][name] = {
@@ -340,7 +339,7 @@ def export_model(model_id, output_dir, image_path, *, group_size=None, ratio=Non
             "embeddings", adapters["embeddings"], {"input_ids": ids},
             {"input_ids": {0: automatic, 1: automatic}},
         )
-        precompute_export_inputs(adapters["vision"], vision_inputs)
+        vision_inputs = precompute_export_inputs(adapters["vision"].config, vision_inputs)
         manifest["vision_input_shapes"] = {
             name: list(value.shape) for name, value in get_leaf_tensors(vision_inputs).items()
         }
@@ -386,8 +385,6 @@ def main(argv=None):
     parser.add_argument("--group-size", type=int, choices=[-1, 32, 64, 128])
     parser.add_argument("--ratio", type=float)
     parser.add_argument("--int4-config", type=Path, help="Override the local per-model INT4 recipes")
-    parser.add_argument("--calibration-data", type=Path,
-                        help="Root containing decoder/, vision/, embeddings/ calibration .npz files")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.ratio is not None and not 0 <= args.ratio <= 1:
@@ -420,7 +417,7 @@ def main(argv=None):
     if args.output_dir is not None and not args.dry_run:
         export_model(model_ids[0], args.output_dir, args.image,
                      group_size=args.group_size, ratio=args.ratio,
-                     int4_config=args.int4_config, calibration_data=args.calibration_data)
+                     int4_config=args.int4_config)
         return 0
     failures = []
     for model_id, output_dir in exports:
@@ -429,7 +426,7 @@ def main(argv=None):
             "--output-dir", str(output_dir), "--image", str(args.image),
         ]
         for option, value in (("--group-size", args.group_size), ("--ratio", args.ratio),
-                              ("--int4-config", args.int4_config), ("--calibration-data", args.calibration_data)):
+                              ("--int4-config", args.int4_config)):
             if value is not None:
                 command.extend([option, str(value)])
         print(f"\n{model_id} -> {output_dir}", flush=True)
