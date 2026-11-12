@@ -17,7 +17,7 @@ hf_script="$script_dir/benchmark_llm_hf.py"
 genai_script="$script_dir/benchmark_llm_genai.py"
 optimum_suffix=-int4-optimum
 hf_genai_suffix=-int4-hf-export-genai
-hf_suffix=-hf-export
+hf_suffix=-int4-hf-export
 prompt_mode=--disable-thinking
 
 usage() {
