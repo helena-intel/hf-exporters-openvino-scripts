@@ -20,7 +20,6 @@ genai_script="$script_dir/benchmark_llm_genai.py"
 optimum_suffix=-int4-optimum
 hf_genai_suffix=-int4-hf-export-genai
 hf_suffix=-int4-hf-export
-prompt_mode=--disable-thinking
 
 usage() {
     printf '%s\n' \
@@ -42,9 +41,6 @@ usage() {
         '  --genai-python PATH     Override Python for both GenAI variants' \
         '  --hf-script PATH        Override native HF benchmark script' \
         '  --genai-script PATH     Override benchmark script for both GenAI variants' \
-        '  --disable-thinking      Request non-thinking chat (default; model-dependent)' \
-        '  --enable-thinking       Use model-default thinking behavior' \
-        '  --no-chat-template      Use raw prompts without a thinking-mode request' \
         '  -h, --help              Show this help'
 }
 
@@ -60,7 +56,6 @@ require_value() {
 while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        --disable-thinking|--enable-thinking|--no-chat-template) prompt_mode=$1; shift ;;
         --models-file|--model-root|--output-dir|--optimum-suffix|--hf-genai-suffix|--hf-suffix|-p|--prompt|-F|--prompt-file|-d|--device|-N|--num-warmup|-n|--num-iter|-M|--max-new-tokens|--python|--hf-python|--genai-python|--hf-script|--genai-script)
             require_value "$@"
             case "$1" in
@@ -141,7 +136,7 @@ run_benchmark() {
         prompt_args=(-F "$prompt_file")
     fi
     local -a command=("$python" -u "$benchmark_script" -m "$model_dir" "${prompt_args[@]}"
-                     -d "$device" -N "$num_warmup" -n "$num_iter" -M "$max_new_tokens" "$prompt_mode")
+                     -d "$device" -N "$num_warmup" -n "$num_iter" -M "$max_new_tokens")
     printf '\n[%s] %s\n' "$backend" "$model_id"
     {
         printf 'Model ID: %s\nStarted: %s\nCommand: ' "$model_id" "$(date -u +%FT%TZ)"
