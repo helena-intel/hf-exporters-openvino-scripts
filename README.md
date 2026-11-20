@@ -161,6 +161,13 @@ Native HF packages load through
 The native VLM benchmark requires `export.json` and rejects legacy component
 packages. Renaming IR files does not turn HF/custom packages into GenAI packages.
 
+Use the same native VLM package for inference and benchmarking:
+
+```bash
+python inference_vlm_hf.py models-native/Qwen3.5-2B-int4-hf-export dog.jpg --device GPU
+python benchmark_vlm_hf_exporters.py -m models-native/Qwen3.5-2B-int4-hf-export -i dog.jpg -d GPU
+```
+
 The GenAI LLM exporter saves model IR, model/generation metadata, HF tokenizer
 files, and tokenizer/detokenizer XML/BIN pairs. HF tokenizer JSON alone is not
 enough for GenAI `Tokenizer.encode()`. Missing/unloadable IRs can produce

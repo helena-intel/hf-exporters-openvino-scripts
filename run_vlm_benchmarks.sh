@@ -4,7 +4,7 @@ export LC_ALL=C
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 models_file="$script_dir/models.txt"
-model_root=.
+model_root=models
 output_dir="benchmark_results/$(date +%Y%m%d_%H%M%S)_$$"
 image=dog.jpg
 prompt='what is this image?'

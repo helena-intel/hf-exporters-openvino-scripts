@@ -1193,7 +1193,7 @@ class UnifiedExportTests(unittest.TestCase):
 
             import contextlib
             import io
-            from inference_vlm import generate_native, main as inference_main
+            from inference_vlm_hf import generate_native, main as inference_main
 
             report = io.StringIO()
             with contextlib.redirect_stdout(report):
@@ -1448,7 +1448,7 @@ class VLMRuntimePerformanceTests(unittest.TestCase):
         import contextlib
         import io
         from unittest.mock import Mock
-        from inference_vlm import main
+        from inference_vlm_hf import main
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1457,8 +1457,8 @@ class VLMRuntimePerformanceTests(unittest.TestCase):
             runner = Mock()
             runner.generate.return_value = {"text": "legacy response", "timings": {}}
             report = io.StringIO()
-            with patch("inference_vlm.OpenVINOVLM", return_value=runner) as load, \
-                    patch("inference_vlm.generate_native") as native, contextlib.redirect_stdout(report):
+            with patch("inference_vlm_hf.OpenVINOVLM", return_value=runner) as load, \
+                    patch("inference_vlm_hf.generate_native") as native, contextlib.redirect_stdout(report):
                 main([str(root), str(image), "--device", "CPU", "--prompt", "Question", "--max-new-tokens", "3"])
             load.assert_called_once_with(root, "CPU")
             runner.generate.assert_called_once_with(image, "Question", max_new_tokens=3)
@@ -1470,7 +1470,7 @@ class VLMRuntimePerformanceTests(unittest.TestCase):
         return ov.Core().compile_model(ov.Model([result], [parameter]), "CPU").create_infer_request()
 
     def test_inference_views_snapshots_and_bf16(self):
-        from inference_vlm import infer
+        from inference_vlm_hf import infer
 
         for element_type in (ov.Type.f32, ov.Type.bf16):
             with self.subTest(element_type=element_type):
@@ -1491,7 +1491,7 @@ class VLMRuntimePerformanceTests(unittest.TestCase):
     def runner(self):
         from types import SimpleNamespace
         from unittest.mock import Mock
-        from inference_vlm import OpenVINOVLM, infer
+        from inference_vlm_hf import OpenVINOVLM, infer
 
         runner = object.__new__(OpenVINOVLM)
         runner.family = "gemma4"
@@ -1521,7 +1521,7 @@ class VLMRuntimePerformanceTests(unittest.TestCase):
         return runner
 
     def test_shared_decode_matches_snapshots_and_profile_adds_up(self):
-        from inference_vlm import infer
+        from inference_vlm_hf import infer
 
         runner = self.runner()
         processed = {"input_ids": torch.tensor([[2, 3, 4]])}
@@ -1535,7 +1535,7 @@ class VLMRuntimePerformanceTests(unittest.TestCase):
                 self.assertTrue(np.all(values["mm_token_type_ids"][:, 3:] == 0))
             return infer(request, values, **{**kwargs, "copy_outputs": True})
 
-        with patch("inference_vlm.infer", side_effect=snapshots):
+        with patch("inference_vlm_hf.infer", side_effect=snapshots):
             expected = runner.generate_processed(processed, max_new_tokens=5, decode_text=False, profile=True)
         actual = runner.generate_processed(processed, max_new_tokens=5, decode_text=False, profile=True)
         repeated = runner.generate_processed(processed, max_new_tokens=5, decode_text=False, profile=True)

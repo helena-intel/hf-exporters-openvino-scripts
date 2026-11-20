@@ -235,7 +235,7 @@ class MediaTests(unittest.TestCase):
     def check_export_and_inference(self, model, processed):
         import json
         from PIL import Image
-        from inference_vlm import OpenVINOVLM, infer
+        from inference_vlm_hf import OpenVINOVLM, infer
 
         processor = Mock(return_value=processed)
         processor.apply_chat_template.return_value = "Describe this image."
@@ -448,7 +448,7 @@ class MediaTests(unittest.TestCase):
 class InferenceHelperTests(unittest.TestCase):
     def test_bfloat16_inputs(self):
         from openvino import opset13 as ops
-        from inference_vlm import infer
+        from inference_vlm_hf import infer
 
         parameter = ops.parameter([1, 3], ov.Type.bf16, name="value")
         parameter.output(0).set_names({"value"})
